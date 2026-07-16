@@ -1,5 +1,5 @@
 diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
-index 1b410b2..e287ee8 100644
+index 1b410b2..65d15dd 100644
 --- a/src/kernel/xam/xam_content.cpp
 +++ b/src/kernel/xam/xam_content.cpp
 @@ -63,6 +63,11 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
@@ -14,7 +14,14 @@ index 1b410b2..e287ee8 100644
    auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
    if ((device_id && device_info == nullptr) || !handle_out) {
      if (buffer_size_ptr) {
-@@ -135,6 +140,13 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+@@ -131,10 +136,19 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+     return X_ERROR_INVALID_PARAMETER;
+   }
+ 
+-  if (content_data.content_type == XContentType::kMarketplaceContent) {
++  auto content_type = static_cast<XContentType>(content_data.content_type);
++
++  if (content_type == XContentType::kMarketplaceContent) {
      xuid = 0;
    }
  
@@ -28,7 +35,32 @@ index 1b410b2..e287ee8 100644
    auto content_manager = REX_KERNEL_STATE()->content_manager();
  
    if (overlapped_ptr && disposition_ptr) {
-@@ -224,6 +236,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+@@ -142,6 +156,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+   }
+ 
+   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
++              content_type,
+               disposition_ptr,
+               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+     X_RESULT result = X_ERROR_INVALID_PARAMETER;
+@@ -174,7 +189,15 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+       case 3:  // OPEN_EXISTING
+                // Open only if exists.
+         if (!content_manager->ContentExists(xuid, content_data)) {
+-          result = X_ERROR_PATH_NOT_FOUND;
++          if (content_type == XContentType::kSavedGame) {
++            REXKRNL_WARN(
++                "XamContentCreate OPEN_EXISTING requested missing saved game '{}'; creating "
++                "directory-backed package",
++                content_data.file_name());
++            disposition = kDispositionState::Create;
++          } else {
++            result = X_ERROR_PATH_NOT_FOUND;
++          }
+         } else {
+           disposition = kDispositionState::Open;
+         }
+@@ -224,6 +247,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
        *disposition_ptr = static_cast<uint32_t>(disposition);
      }
  
@@ -39,6 +71,48 @@ index 1b410b2..e287ee8 100644
      extended_error = X_HRESULT_FROM_WIN32(result);
      length = static_cast<uint32_t>(disposition);
      return result;
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index edb3b3d..d0bbf7c 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/logging.h>
++#include <rex/memory.h>
+ #include <rex/runtime.h>
+ #include <rex/string.h>
+ #include <rex/string/util.h>
+@@ -276,11 +277,18 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
+       result_ptr.guest_address(), overlapped.guest_address());
+   std::string title;
+   if (title_ptr) {
+-    title = rex::string::to_utf8(title_ptr.value());
++    title = rex::string::to_utf8(
++        rex::memory::load_and_swap<std::u16string>(title_ptr.host_address()));
+   } else {
+     title = "";  // TODO(gibbed): default title based on flags?
+   }
+ 
++  std::string text;
++  if (text_ptr) {
++    text = rex::string::to_utf8(
++        rex::memory::load_and_swap<std::u16string>(text_ptr.host_address()));
++  }
++
+   std::vector<std::string> buttons;
+   for (uint32_t i = 0; i < button_count; ++i) {
+     uint32_t button_ptr = button_ptrs[i];
+@@ -321,8 +329,7 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
+     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+     if (imgui_drawer) {
+       result = xeXamDispatchDialog<MessageBoxDialog>(
+-          new MessageBoxDialog(imgui_drawer, title, rex::string::to_utf8(text_ptr.value()), buttons,
+-                               active_button),
++          new MessageBoxDialog(imgui_drawer, title, text, buttons, active_button),
+           close, overlapped.guest_address());
+     } else {
+       // Fallback to headless if no drawer available
 diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
 index 67f7070..c730192 100644
 --- a/src/system/function_dispatcher.cpp
@@ -103,10 +177,42 @@ index f9eac23..7736cc0 100644
    return true;
  }
 diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
-index 1ca9457..2fd9e59 100644
+index 1ca9457..d93d2f3 100644
 --- a/src/system/xam/content_manager.cpp
 +++ b/src/system/xam/content_manager.cpp
-@@ -202,6 +202,11 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+@@ -38,6 +38,31 @@ static const char* kGameContentHeaderDirName = "Headers";
+ 
+ static int content_device_id_ = 0;
+ 
++static bool ShouldSeedEmptySaveFile(const XCONTENT_AGGREGATE_DATA& data) {
++  return data.content_type == XContentType::kSavedGame && data.file_name() == "Game Play Data";
++}
++
++static X_RESULT SeedEmptySaveFileIfMissing(const std::filesystem::path& package_path,
++                                           const XCONTENT_AGGREGATE_DATA& data) {
++  if (!ShouldSeedEmptySaveFile(data)) {
++    return X_ERROR_SUCCESS;
++  }
++
++  auto file_path = package_path / "savegame.txt";
++  if (std::filesystem::exists(file_path)) {
++    return X_ERROR_SUCCESS;
++  }
++
++  std::error_code ec;
++  std::filesystem::create_directories(file_path.parent_path(), ec);
++  if (ec) {
++    return X_ERROR_ACCESS_DENIED;
++  }
++
++  REXSYS_DEBUG("XContent seed file: file='{}', path={}", data.file_name(), file_path.string());
++  return rex::filesystem::CreateEmptyFile(file_path) ? X_ERROR_SUCCESS : X_ERROR_ACCESS_DENIED;
++}
++
+ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
+                                const XCONTENT_AGGREGATE_DATA& data,
+                                const std::filesystem::path& package_path)
+@@ -202,6 +227,11 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
        ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
    auto parent_path = header_path.parent_path();
  
@@ -118,7 +224,7 @@ index 1ca9457..2fd9e59 100644
    if (!std::filesystem::exists(parent_path)) {
      if (!std::filesystem::create_directories(parent_path)) {
        return X_ERROR_ACCESS_DENIED;
-@@ -265,6 +270,9 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+@@ -265,12 +295,19 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
    }
  
    auto package_path = ResolvePackagePath(xuid, data);
@@ -128,7 +234,17 @@ index 1ca9457..2fd9e59 100644
    if (std::filesystem::exists(package_path)) {
      return X_ERROR_ALREADY_EXISTS;
    }
-@@ -295,6 +303,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+   if (!std::filesystem::create_directories(package_path)) {
+     return X_ERROR_ACCESS_DENIED;
+   }
++  auto seed_result = SeedEmptySaveFileIfMissing(package_path, data);
++  if (XFAILED(seed_result)) {
++    return seed_result;
++  }
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+ 
+@@ -295,9 +332,16 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
    }
  
    auto package_path = ResolvePackagePath(xuid, data);
@@ -138,7 +254,14 @@ index 1ca9457..2fd9e59 100644
    if (!std::filesystem::exists(package_path)) {
      return X_ERROR_FILE_NOT_FOUND;
    }
-@@ -373,6 +384,9 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
++  auto seed_result = SeedEmptySaveFileIfMissing(package_path, data);
++  if (XFAILED(seed_result)) {
++    return seed_result;
++  }
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+@@ -373,6 +417,9 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
    }
  
    auto package_path = ResolvePackagePath(xuid, data);
