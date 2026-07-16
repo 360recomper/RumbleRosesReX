@@ -1,0 +1,27 @@
+# Build products
+/out/
+
+# Generated code derived from local game binaries
+/generated/default/
+
+# Local game dump/material. Keep the note file.
+/assets/*
+!/assets/README.md
+
+# Common Xbox 360 dump artifacts
+*.xex
+*.dll
+*.iso
+*.7z
+*.rar
+*.zip
+*.xcp
+*.zar
+*.pak
+*.bin
+*.dmp
+*.pdb
+
+# Logs and scratch output
+*.log
+*.tmp
