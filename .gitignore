@@ -25,3 +25,6 @@
 # Logs and scratch output
 *.log
 *.tmp
+
+# Release packages
+/dist/

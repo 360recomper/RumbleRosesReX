@@ -1,0 +1,1614 @@
+diff --git a/cmake/rexglue_fidelityfx.cmake b/cmake/rexglue_fidelityfx.cmake
+index af35fa8..58cc387 100644
+--- a/cmake/rexglue_fidelityfx.cmake
++++ b/cmake/rexglue_fidelityfx.cmake
+@@ -8,8 +8,12 @@ if(NOT REXGLUE_ENABLE_FIDELITYFX)
+     return()
+ endif()
+ 
++# CAS-only: just the headers + committed SPIR-V CAS shaders (REX_HAS_FIDELITYFX_SDK).
++# Skips the FSR2/3 backend library, so no Vulkan SDK / glslc is needed.
++option(REXGLUE_FIDELITYFX_CAS_ONLY "FidelityFX: build only CAS sharpening (no FSR backend)" ON)
++
+ # ── Dependency validation ────────────────────────────────────────────────
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT REXGLUE_FIDELITYFX_CAS_ONLY)
+     find_package(Vulkan QUIET)
+     if(NOT Vulkan_FOUND)
+         message(WARNING
+@@ -62,6 +66,11 @@ set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
+     "Root of the fetched FidelityFX SDK source tree")
+ 
+ # ── Backend selection ────────────────────────────────────────────────────
++if(REXGLUE_FIDELITYFX_CAS_ONLY)
++    message(STATUS "FidelityFX: CAS-only mode (no FSR backend library)")
++    return()
++endif()
++
+ set(REXGLUE_FIDELITYFX_BACKEND "auto" CACHE STRING
+     "FidelityFX backend to build (auto, vk, dx12)")
+ set_property(CACHE REXGLUE_FIDELITYFX_BACKEND PROPERTY STRINGS auto vk dx12)
+diff --git a/include/rex/audio/audio_driver.h b/include/rex/audio/audio_driver.h
+index 37ccbf2..269003e 100644
+--- a/include/rex/audio/audio_driver.h
++++ b/include/rex/audio/audio_driver.h
+@@ -11,11 +11,17 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <rex/kernel.h>
+ #include <rex/memory.h>
+ 
+ namespace rex::audio {
+ 
++/// Set by the app (e.g. on window focus loss) to silence output without
++/// stopping the guest audio thread.
++inline std::atomic<bool> g_audio_muted{false};
++
+ class AudioDriver {
+  public:
+   explicit AudioDriver(memory::Memory* memory);
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..64e304d 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -266,6 +266,14 @@ class XmaContext {
+ 
+   static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
+ 
++  // Custom ("fake XMA") frames: a frame whose payload starts with
++  // kCustomFrameMagic carries host-decodable audio (IMA ADPCM or linear PCM)
++  // instead of XMA. Modded wave banks keep the XMA tag, so the guest's XACT
++  // streams them like any track, without an XMA encoder.
++  static const uint32_t kCustomFrameMagic = 0x52525841;  // 'RRXA'
++  bool DecodeCustomFrame(XMA_CONTEXT_DATA* data, uint32_t padding_start, uint32_t frame_size,
++                         bool is_loop_end_frame);
++
+   memory::Memory* memory_ = nullptr;
+   std::unique_ptr<rex::thread::Event> work_completion_event_;
+ 
+diff --git a/include/rex/filesystem/devices/host_path_device.h b/include/rex/filesystem/devices/host_path_device.h
+index 48100be..980ff9e 100644
+--- a/include/rex/filesystem/devices/host_path_device.h
++++ b/include/rex/filesystem/devices/host_path_device.h
+@@ -37,6 +37,12 @@ class HostPathDevice : public Device {
+   bool allow_share_delete() const { return allow_share_delete_; }
+   const std::filesystem::path& host_path() const { return host_path_; }
+ 
++  // Loose-file overlay: files under this directory replace same-named files in
++  // host_path (and new files are added). Must be set before Initialize().
++  void set_overlay_path(const std::filesystem::path& overlay_path) {
++    overlay_path_ = overlay_path;
++  }
++
+   const std::string& name() const override { return name_; }
+   uint32_t attributes() const override { return 0; }
+   uint32_t component_name_max_length() const override { return 255; }
+@@ -47,10 +53,11 @@ class HostPathDevice : public Device {
+   uint32_t bytes_per_sector() const override { return 0x200; }
+ 
+  private:
+-  void PopulateEntry(HostPathEntry* parent_entry);
++  void PopulateEntry(HostPathEntry* parent_entry, const std::filesystem::path& overlay_dir);
+ 
+   std::string name_;
+   std::filesystem::path host_path_;
++  std::filesystem::path overlay_path_;
+   std::unique_ptr<Entry> root_entry_;
+   bool read_only_;
+   bool allow_share_delete_;
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..ebfde3b 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <memory>
+ #include <vector>
+ 
+@@ -25,6 +26,9 @@ class Window;
+ 
+ namespace rex::input {
+ 
++/// Set by the app (e.g. on window focus loss) to hide the pad from the game.
++inline std::atomic<bool> g_input_blocked{false};
++
+ class InputSystem : public system::IInputSystem {
+  public:
+   explicit InputSystem(rex::ui::Window* window);
+@@ -38,6 +42,9 @@ class InputSystem : public system::IInputSystem {
+   void AddDriver(std::unique_ptr<InputDriver> driver);
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
++  /// Called from GetState (user 0) with the merged pad. Return true to hide
++  /// the pad from the game (state is zeroed), e.g. while an overlay owns it.
++  void SetPadHook(std::function<bool(const X_INPUT_GAMEPAD&)> hook);
+ 
+   /// Replaces any previous assignment. Call before the guest starts polling.
+   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+@@ -55,6 +62,7 @@ class InputSystem : public system::IInputSystem {
+   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+ 
+   rex::ui::Window* window_ = nullptr;
++  std::function<bool(const X_INPUT_GAMEPAD&)> pad_hook_;
+ 
+   std::vector<std::unique_ptr<InputDriver>> drivers_;
+ 
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 1f52480..6e2abf7 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -298,6 +298,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   std::unique_ptr<ui::Window> window_;
+   std::thread module_thread_;
+   std::atomic<bool> shutting_down_{false};
++  std::atomic<bool> pad_combo_down_{false};
++  std::function<void()> toggle_settings_;
+   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
+   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+ 
+diff --git a/include/rex/system/info/file.h b/include/rex/system/info/file.h
+index ef0a9ad..3c133dc 100644
+--- a/include/rex/system/info/file.h
++++ b/include/rex/system/info/file.h
+@@ -65,7 +65,8 @@ struct X_FILE_BASIC_INFORMATION {
+   be<uint64_t> last_access_time;
+   be<uint64_t> last_write_time;
+   be<uint64_t> change_time;
+-  be<uint64_t> attributes;
++  be<uint32_t> attributes;  // ULONG FileAttributes
++  be<uint32_t> padding;
+ };
+ static_assert_size(X_FILE_BASIC_INFORMATION, 0x28);
+ 
+diff --git a/include/rex/system/xam/content_manager.h b/include/rex/system/xam/content_manager.h
+index 949d185..ec19afa 100644
+--- a/include/rex/system/xam/content_manager.h
++++ b/include/rex/system/xam/content_manager.h
+@@ -152,10 +152,13 @@ class ContentManager {
+                                                  const XCONTENT_AGGREGATE_DATA& data);
+ 
+   bool ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
++  // seed_save_file: drop an empty placeholder save file into the package. Only for
++  // OPEN_EXISTING (load) requests; a save that creates its file would collide with it.
+   X_RESULT CreateContent(const std::string_view root_name, uint64_t xuid,
+-                         const XCONTENT_AGGREGATE_DATA& data);
++                         const XCONTENT_AGGREGATE_DATA& data, bool seed_save_file = false);
+   X_RESULT OpenContent(const std::string_view root_name, uint64_t xuid,
+-                       const XCONTENT_AGGREGATE_DATA& data, uint32_t& content_license);
++                       const XCONTENT_AGGREGATE_DATA& data, uint32_t& content_license,
++                       bool seed_save_file = false);
+   X_RESULT CloseContent(const std::string_view root_name);
+   X_RESULT GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                std::vector<uint8_t>* buffer);
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index a570fa0..983fe09 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -12,6 +12,7 @@
+ #ifndef REX_UI_IMGUI_DRAWER_H_
+ #define REX_UI_IMGUI_DRAWER_H_
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -40,6 +41,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   ~ImGuiDrawer();
+ 
+   ImGuiIO& GetIO();
++  // Latest pad state for ImGui navigation (thread-safe; call from any thread).
++  // active=false releases all pad keys and turns pad navigation off.
++  void SetGamepadInput(bool active, uint16_t buttons, int16_t lx, int16_t ly);
+ 
+   // Per-overlay styling, patched by the consumer in OnConfigureStyle.
+   Style& style() { return style_; }
+@@ -76,6 +80,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+  private:
+   void Initialize();
++  void ApplyGamepadInput(ImGuiIO& io);
++  std::atomic<uint64_t> gamepad_packed_{0};  // bit 63 = active
++  uint16_t gamepad_prev_buttons_ = 0;
++  bool gamepad_prev_active_ = false;
+ 
+   void SetupFontTexture();
+ 
+diff --git a/include/rex/ui/overlay/settings_overlay.h b/include/rex/ui/overlay/settings_overlay.h
+index 5b80eac..f622e42 100644
+--- a/include/rex/ui/overlay/settings_overlay.h
++++ b/include/rex/ui/overlay/settings_overlay.h
+@@ -11,6 +11,7 @@
+  */
+ #pragma once
+ #include <filesystem>
++#include <functional>
+ #include <string>
+ #include <rex/ui/imgui_dialog.h>
+ 
+@@ -19,14 +20,27 @@ namespace rex::ui {
+ class SettingsDialog : public ImGuiDialog {
+  public:
+   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
+-  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path);
++  // on_quit: called by the "Quit game" button (button hidden when empty)
++  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
++                 std::function<void()> on_quit = {});
+   ~SettingsDialog();
+ 
++  // Called when the pad's B button is pressed with no popup open (close request).
++  void set_on_close(std::function<void()> fn) { on_close_ = std::move(fn); }
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+  private:
++  void DrawQuickSettings();
++
+   std::filesystem::path config_path_;
++  std::function<void()> on_quit_;
++  std::function<void()> on_close_;
++  bool popup_open_prev_ = false;
++  bool pad_mode_ = false;  // last input was the pad: combos become cycle buttons
++  bool confirm_restore_ = false;
++  std::string save_status_;
+   char search_buf_[128] = {};
+   std::string selected_category_;
+   std::string capturing_bind_name_;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..924b0c4 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -123,6 +123,8 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
++  if (g_audio_muted.load(std::memory_order_relaxed))
++    std::memset(output_frame, 0, frame_samples_ * sizeof(float));
+ 
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..dbd27c1 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -658,6 +658,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   const uint32_t padding_start =
+       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
+ 
++  if (DecodeCustomFrame(data, padding_start, packet_info.current_frame_size_, is_loop_end_frame)) {
++    // Own audio already sits in raw_frame_; only the next-offset step remains.
++  } else {
+   decoded_frame_.fill(0);
+ 
+   if (PrepareDecoder(data->sample_rate, bool(data->is_stereo)) == 1) {
+@@ -708,6 +711,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     // two blocks that are not neighbors.
+     carry_valid_ = false;
+   }
++  }
+ 
+   // Compute where to go next.
+   if (is_loop_end_frame) {
+@@ -740,6 +744,104 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   data->input_buffer_read_offset = next_input_offset;
+ }
+ 
++bool XmaContext::DecodeCustomFrame(XMA_CONTEXT_DATA* data, uint32_t padding_start,
++                                   uint32_t frame_size, bool is_loop_end_frame) {
++  // Frame bits start after the PreparePacket byte and the copy's lead-in bits.
++  const uint8_t* bits = xma_frame_.data();
++  size_t pos = 8 + padding_start + kBitsPerFrameHeader;
++  const size_t end = 8 + padding_start + frame_size;
++  auto read = [&](uint32_t n) -> uint32_t {
++    uint32_t v = 0;
++    for (uint32_t i = 0; i < n; i++, pos++) {
++      v = (v << 1) | ((bits[pos >> 3] >> (7 - (pos & 7))) & 1);
++    }
++    return v;
++  };
++  if (frame_size < kBitsPerFrameHeader + 40 || read(32) != kCustomFrameMagic) {
++    return false;
++  }
++
++  // Header: codec:4 (1 = IMA ADPCM, 2 = linear PCM), channels:4, then per codec.
++  const uint32_t codec = read(4);
++  const uint32_t channels = read(4);
++  static std::atomic<uint32_t> logged{0};
++  if (logged.fetch_add(1) == 0) {
++    REXAPU_INFO("XmaContext {}: custom RRXA audio stream (codec {}, {} ch)", id(), codec, channels);
++  }
++  const uint32_t out_channels = data->is_stereo ? 2 : 1;
++  std::array<int16_t, kSamplesPerFrame * 2> pcm{};
++
++  if (codec == 1 && (channels == 1 || channels == 2) &&
++      pos + channels * 23 + kSamplesPerFrame * channels * 4 <= end) {
++    static const int16_t kSteps[89] = {
++        7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,    23,
++        25,    28,    31,    34,    37,    41,    45,    50,    55,    60,    66,    73,    80,
++        88,    97,    107,   118,   130,   143,   157,   173,   190,   209,   230,   253,   279,
++        307,   337,   371,   408,   449,   494,   544,   598,   658,   724,   796,   876,   963,
++        1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,  2272,  2499,  2749,  3024,  3327,
++        3660,  4026,  4428,  4871,  5358,  5894,  6484,  7132,  7845,  8630,  9493,  10442, 11487,
++        12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
++    static const int8_t kIndexAdjust[8] = {-1, -1, -1, -1, 2, 4, 6, 8};
++    int32_t pred[2], index[2];
++    for (uint32_t c = 0; c < channels; c++) {
++      pred[c] = static_cast<int16_t>(read(16));
++      index[c] = std::min<int32_t>(read(7), 88);
++    }
++    for (uint32_t s = 0; s < kSamplesPerFrame; s++) {
++      for (uint32_t c = 0; c < channels; c++) {
++        const uint32_t n = read(4);
++        const int32_t step = kSteps[index[c]];
++        int32_t diff = step >> 3;
++        if (n & 1) diff += step >> 2;
++        if (n & 2) diff += step >> 1;
++        if (n & 4) diff += step;
++        pred[c] = std::clamp<int32_t>((n & 8) ? pred[c] - diff : pred[c] + diff, -32768, 32767);
++        index[c] = std::clamp<int32_t>(index[c] + kIndexAdjust[n & 7], 0, 88);
++        pcm[s * 2 + c] = static_cast<int16_t>(pred[c]);
++      }
++      if (channels == 1) pcm[s * 2 + 1] = pcm[s * 2];
++    }
++  } else if (codec == 2 && (channels == 1 || channels == 2)) {
++    const uint32_t sample_bits = read(4) + 1;
++    if (sample_bits >= 8 && pos + kSamplesPerFrame * channels * sample_bits <= end) {
++      for (uint32_t s = 0; s < kSamplesPerFrame; s++) {
++        for (uint32_t c = 0; c < channels; c++) {
++          pcm[s * 2 + c] = static_cast<int16_t>(read(sample_bits) << (16 - sample_bits));
++        }
++        if (channels == 1) pcm[s * 2 + 1] = pcm[s * 2];
++      }
++    } else {
++      REXAPU_ERROR("XmaContext {}: bad custom PCM frame", id());
++    }
++  } else {
++    REXAPU_ERROR("XmaContext {}: bad custom frame (codec {}, channels {})", id(), codec, channels);
++  }
++
++  // Output: big-endian s16, interleaved when the context is stereo. Unlike
++  // ffmpeg there is no decoder delay, so the frame goes out right away.
++  auto out = reinterpret_cast<uint16_t*>(raw_frame_.data());
++  for (uint32_t s = 0; s < kSamplesPerFrame; s++) {
++    if (out_channels == 2) {
++      out[s * 2] = rex::byte_swap(static_cast<uint16_t>(pcm[s * 2]));
++      out[s * 2 + 1] = rex::byte_swap(static_cast<uint16_t>(pcm[s * 2 + 1]));
++    } else {
++      out[s] = rex::byte_swap(static_cast<uint16_t>((pcm[s * 2] + pcm[s * 2 + 1]) / 2));
++    }
++  }
++
++  carry_valid_ = false;
++  current_frame_remaining_subframes_ = 4 << data->is_stereo;
++  loop_frame_output_limit_ =
++      is_loop_end_frame ? static_cast<uint8_t>((data->loop_subframe_end + 1) << data->is_stereo) : 0;
++  if (loop_start_skip_pending_) {
++    current_frame_remaining_subframes_ -= std::min<uint8_t>(
++        static_cast<uint8_t>(data->loop_subframe_skip << data->is_stereo),
++        current_frame_remaining_subframes_);
++    loop_start_skip_pending_ = false;
++  }
++  return true;
++}
++
+ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
+                               uint8_t* output_buffer) {
+   // Loop through every sample, convert and drop it into the output array.
+diff --git a/src/core/filesystem_win.cpp b/src/core/filesystem_win.cpp
+index c5a2c5d..7c19a61 100644
+--- a/src/core/filesystem_win.cpp
++++ b/src/core/filesystem_win.cpp
+@@ -43,9 +43,20 @@ std::filesystem::path to_path(const std::u16string_view source) {
+ namespace filesystem {
+ 
+ std::filesystem::path GetExecutablePath() {
+-  wchar_t* path;
+-  auto error = _get_wpgmptr(&path);
+-  return !error ? std::filesystem::path(path) : std::filesystem::path();
++  // _get_wpgmptr only works in wide-entry (wmain/wWinMain) programs; in a narrow main()
++  // program such as rexglue.exe codegen it trips the CRT invalid-parameter handler (0xC0000409).
++  std::wstring path(MAX_PATH, L'\0');
++  for (;;) {
++    DWORD len = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
++    if (len == 0) {
++      return std::filesystem::path();
++    }
++    if (len < path.size()) {
++      path.resize(len);
++      return std::filesystem::path(path);
++    }
++    path.resize(path.size() * 2);
++  }
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
+diff --git a/src/filesystem/devices/host_path_device.cpp b/src/filesystem/devices/host_path_device.cpp
+index f68b79a..6928358 100644
+--- a/src/filesystem/devices/host_path_device.cpp
++++ b/src/filesystem/devices/host_path_device.cpp
+@@ -46,7 +46,16 @@ bool HostPathDevice::Initialize() {
+   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
+   root_entry->attributes_ = kFileAttributeDirectory;
+   root_entry_ = std::unique_ptr<Entry>(root_entry);
+-  PopulateEntry(root_entry);
++  std::filesystem::path overlay_dir;
++  if (!overlay_path_.empty()) {
++    if (std::filesystem::is_directory(overlay_path_)) {
++      overlay_dir = overlay_path_;
++      REXFS_INFO("Mods overlay enabled: {}", rex::path_to_utf8(overlay_path_));
++    } else {
++      REXFS_INFO("Mods overlay folder not found, skipping: {}", rex::path_to_utf8(overlay_path_));
++    }
++  }
++  PopulateEntry(root_entry, overlay_dir);
+ 
+   return true;
+ }
+@@ -113,15 +122,55 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
+   return current_entry;
+ }
+ 
+-void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
++void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry,
++                                   const std::filesystem::path& overlay_dir) {
++  using Type = rex::filesystem::FileInfo::Type;
+   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
+   for (auto& child_info : child_infos) {
+-    auto child = HostPathEntry::Create(this, parent_entry,
+-                                       parent_entry->host_path() / child_info.name, child_info);
++    auto host_file = parent_entry->host_path() / child_info.name;
++    auto info = child_info;
++    std::filesystem::path child_overlay;
++    if (!overlay_dir.empty()) {
++      auto overlay_file = overlay_dir / child_info.name;
++      rex::filesystem::FileInfo overlay_info;
++      if (rex::filesystem::GetInfo(overlay_file, &overlay_info) && overlay_info.type == child_info.type) {
++        if (child_info.type == Type::kDirectory) {
++          child_overlay = overlay_file;
++        } else {
++          REXFS_INFO("Mods overlay: {} -> {}", rex::path_to_utf8(host_file),
++                     rex::path_to_utf8(overlay_file));
++          host_file = overlay_file;
++          overlay_info.name = child_info.name;
++          info = overlay_info;
++        }
++      }
++    }
++    auto child = HostPathEntry::Create(this, parent_entry, host_file, info);
+     parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
+ 
+-    if (child_info.type == rex::filesystem::FileInfo::Type::kDirectory) {
+-      PopulateEntry(child);
++    if (child_info.type == Type::kDirectory) {
++      PopulateEntry(child, child_overlay);
++    }
++  }
++
++  // Files/folders that exist only in the overlay are added as new entries.
++  if (overlay_dir.empty()) {
++    return;
++  }
++  for (auto& overlay_info : rex::filesystem::ListFiles(overlay_dir)) {
++    auto name = rex::path_to_utf8(overlay_info.name);
++    bool in_base = std::any_of(child_infos.begin(), child_infos.end(), [&](const auto& info) {
++      return rex::string::utf8_equal_case(rex::path_to_utf8(info.name), name);
++    });
++    if (in_base) {
++      continue;
++    }
++    auto overlay_file = overlay_dir / overlay_info.name;
++    REXFS_INFO("Mods overlay: added {}", rex::path_to_utf8(overlay_file));
++    auto child = HostPathEntry::Create(this, parent_entry, overlay_file, overlay_info);
++    parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
++    if (overlay_info.type == Type::kDirectory) {
++      PopulateEntry(child, {});
+     }
+   }
+ }
+diff --git a/src/filesystem/devices/host_path_file.cpp b/src/filesystem/devices/host_path_file.cpp
+index 4c57a18..8688538 100644
+--- a/src/filesystem/devices/host_path_file.cpp
++++ b/src/filesystem/devices/host_path_file.cpp
+@@ -1,4 +1,4 @@
+-/**
++﻿/**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+  ******************************************************************************
+@@ -12,6 +12,12 @@
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
+ 
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/filesystem.h>
++
++REXCVAR_DEFINE_BOOL(log_file_reads, false, "Runtime", "Log every game file read (path, offset, size)");
++
+ namespace rex::filesystem {
+ 
+ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
+@@ -30,6 +36,11 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+     return X_STATUS_ACCESS_DENIED;
+   }
+ 
++  if (REXCVAR_GET(log_file_reads)) {
++    REXFS_INFO("read {} @0x{:X} size 0x{:X}",
++               rex::path_to_utf8(static_cast<HostPathEntry*>(entry_)->host_path()), byte_offset,
++               buffer.size());
++  }
+   if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
+     return X_STATUS_SUCCESS;
+   } else {
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..dfa63e6 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -212,6 +212,10 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++void InputSystem::SetPadHook(std::function<bool(const X_INPUT_GAMEPAD&)> hook) {
++  pad_hook_ = std::move(hook);
++}
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+@@ -245,6 +249,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (user_index == 0 && pad_hook_ && pad_hook_(merged.gamepad)) {
++    merged.gamepad = {};
++  }
++  if (g_input_blocked.load(std::memory_order_relaxed)) {
++    merged.gamepad = {};
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..ffd8075 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -63,6 +63,11 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+                                      mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
+   assert_not_null(handle_out);
+ 
++  REXKRNL_DEBUG(
++      "XamContentCreateEnumerator(user={}, device={:08X}, type={:08X}, flags={:08X}, items={})",
++      uint32_t(user_index), uint32_t(device_id), uint32_t(content_type),
++      uint32_t(content_flags), uint32_t(items_per_enumerate));
++
+   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
+   if ((device_id && device_info == nullptr) || !handle_out) {
+     if (buffer_size_ptr) {
+@@ -99,6 +104,8 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+       for (const auto& content_data : common_datas) {
+         auto item = e->AppendItem();
+         *item = content_data;
++        REXKRNL_INFO("XamContentCreateEnumerator: common item device={:08X} type={:08X} file='{}'",
++                      uint32_t(item->device_id), uint32_t(XContentType(item->content_type)), item->file_name());
+       }
+     }
+   }
+@@ -107,7 +114,7 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+     // TODO(gibbed): disc drive content
+   }
+ 
+-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
++  REXKRNL_INFO("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
+ 
+   *handle_out = e->handle();
+   return X_ERROR_SUCCESS;
+@@ -131,10 +138,19 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+     return X_ERROR_INVALID_PARAMETER;
+   }
+ 
+-  if (content_data.content_type == XContentType::kMarketplaceContent) {
++  auto content_type = static_cast<XContentType>(content_data.content_type);
++
++  if (content_type == XContentType::kMarketplaceContent) {
+     xuid = 0;
+   }
+ 
++  REXKRNL_INFO(
++      "XamContentCreate(root='{}', user={}, device={:08X}, type={:08X}, file='{}', flags={:08X}, "
++      "cache_size={}, content_size={})",
++      root_name.value(), uint32_t(user_index), uint32_t(content_data.device_id),
++      static_cast<uint32_t>(static_cast<XContentType>(content_data.content_type)),
++      content_data.file_name(), uint32_t(flags), uint32_t(cache_size), uint64_t(content_size));
++
+   auto content_manager = REX_KERNEL_STATE()->content_manager();
+ 
+   if (overlapped_ptr && disposition_ptr) {
+@@ -142,10 +158,13 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+   }
+ 
+   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
++              content_type,
+               disposition_ptr,
+               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+     X_RESULT result = X_ERROR_INVALID_PARAMETER;
+     kDispositionState disposition = kDispositionState::Unknown;
++    // Only loads (OPEN_EXISTING) get the placeholder save file; saves create it themselves.
++    bool seed_save_file = (flags & 0xF) == 3;
+     switch (flags & 0xF) {
+       case 1:  // CREATE_NEW
+                // Fail if exists.
+@@ -174,7 +193,15 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+       case 3:  // OPEN_EXISTING
+                // Open only if exists.
+         if (!content_manager->ContentExists(xuid, content_data)) {
+-          result = X_ERROR_PATH_NOT_FOUND;
++          if (content_type == XContentType::kSavedGame) {
++            REXKRNL_WARN(
++                "XamContentCreate OPEN_EXISTING requested missing saved game '{}'; creating "
++                "directory-backed package",
++                content_data.file_name());
++            disposition = kDispositionState::Create;
++          } else {
++            result = X_ERROR_PATH_NOT_FOUND;
++          }
+         } else {
+           disposition = kDispositionState::Open;
+         }
+@@ -208,12 +235,13 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+ 
+     uint32_t content_license = 0;
+     if (disposition == kDispositionState::Create) {
+-      result = content_manager->CreateContent(root_name, xuid, content_data);
++      result = content_manager->CreateContent(root_name, xuid, content_data, seed_save_file);
+       if (XSUCCEEDED(result)) {
+         content_manager->WriteContentHeaderFile(xuid, content_data);
+       }
+     } else if (disposition == kDispositionState::Open) {
+-      result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
++      result = content_manager->OpenContent(root_name, xuid, content_data, content_license,
++                                            seed_save_file);
+     }
+ 
+     if (license_mask_ptr && XSUCCEEDED(result)) {
+@@ -224,16 +252,36 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+       *disposition_ptr = static_cast<uint32_t>(disposition);
+     }
+ 
++    REXKRNL_INFO("XamContentCreate result: root='{}', file='{}', disposition={}, result={:08X}",
++                  root_name, content_data.file_name(), static_cast<uint32_t>(disposition),
++                  uint32_t(result));
++
+     extended_error = X_HRESULT_FROM_WIN32(result);
+     length = static_cast<uint32_t>(disposition);
+     return result;
+   };
+ 
++  // A host exception here (e.g. std::filesystem) would otherwise abort the whole process.
++  auto safe_run = [run, root = root_name.value(), file = content_data.file_name()](
++                      uint32_t& extended_error, uint32_t& length) -> X_RESULT {
++    try {
++      return run(extended_error, length);
++    } catch (const std::exception& e) {
++      REXKRNL_ERROR("XamContentCreate(root='{}', file='{}') threw: {}", root, file, e.what());
++    } catch (...) {
++      REXKRNL_ERROR("XamContentCreate(root='{}', file='{}') threw an unknown exception", root,
++                    file);
++    }
++    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_FILE_NOT_FOUND);
++    length = 0;
++    return X_ERROR_FILE_NOT_FOUND;
++  };
++
+   if (!overlapped_ptr) {
+     uint32_t extended_error, length;
+-    return run(extended_error, length);
++    return safe_run(extended_error, length);
+   } else {
+-    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped_ptr.guest_address());
++    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(safe_run, overlapped_ptr.guest_address());
+     return X_ERROR_IO_PENDING;
+   }
+ }
+diff --git a/src/kernel/xam/xam_enum.cpp b/src/kernel/xam/xam_enum.cpp
+index 9dcab94..da059e4 100644
+--- a/src/kernel/xam/xam_enum.cpp
++++ b/src/kernel/xam/xam_enum.cpp
+@@ -73,13 +73,16 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
+ 
+ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_length,
+                        mapped_u32 items_returned, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+-  uint32_t dummy;
++  uint32_t dummy = 0;
+   auto result =
+       xeXamEnumerate(handle, flags, buffer, buffer_length,
+                      !overlapped.guest_address() ? &dummy : nullptr, overlapped.guest_address());
+   if (!overlapped && items_returned) {
+     *items_returned = dummy;
+   }
++  REXKRNL_INFO("XamEnumerate(handle={:08X}, buffer={:08X}, length={}, overlapped={:08X}) -> {:08X}, items={}",
++                uint32_t(handle), buffer.guest_address(), uint32_t(buffer_length),
++                overlapped.guest_address(), result, dummy);
+   return result;
+ }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+index bd5de65..f1aee1a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+@@ -267,7 +267,14 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
+         basic_result &= file->entry()->SetWriteTimestamp(info->last_write_time);
+       }
+ 
+-      basic_result &= file->entry()->SetAttributes(info->attributes);
++      // NT semantics: FileAttributes == 0 means "leave unchanged", and the
++      // directory bit cannot be changed through FileBasicInformation.
++      uint32_t attributes = info->attributes;
++      if (attributes) {
++        uint32_t directory_bit = file->entry()->attributes() & X_FILE_ATTRIBUTE_DIRECTORY;
++        attributes = (attributes & ~uint32_t(X_FILE_ATTRIBUTE_DIRECTORY)) | directory_bit;
++        basic_result &= file->entry()->SetAttributes(attributes);
++      }
+       if (!basic_result) {
+         result = X_STATUS_UNSUCCESSFUL;
+       }
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..7d203ac 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -35,8 +35,12 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ }  // namespace
+ 
+ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+-            ctx.last_indirect_target);
++  REX_FATAL(
++      "Call to invalid or unregistered function at guest address 0x{:08X} "
++      "(lr=0x{:08X}, ctr=0x{:08X}, r3=0x{:08X}, r4=0x{:08X}, r5=0x{:08X}, r6=0x{:08X}, "
++      "r7=0x{:08X}, r8=0x{:08X}, r9=0x{:08X}, r10=0x{:08X}, r11=0x{:08X}, r12=0x{:08X})",
++      ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr), ctx.ctr.u32, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
++      ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, ctx.r11.u32, ctx.r12.u32);
+ }
+ 
+ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+@@ -70,6 +74,8 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
+   auto* ctx = thread_state->context();
+   auto* previous_thread_state = ThreadState::Get();
+ 
++  ctx->fpscr.InitHost();
++
+   // Rebind the active guest thread for cross-module callbacks.
+   ThreadState::Bind(thread_state);
+ 
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..a7e4d7e 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+ #include <rex/filesystem/vfs.h>
+@@ -33,6 +34,10 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
+ REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
++REXCVAR_DEFINE_STRING(mods_root, "", "Runtime",
++                      "Loose-file mods folder; files here replace same-named game files");
++REXCVAR_DEFINE_BOOL(mods_enabled, true, "Runtime", "Load files from the mods folder")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex {
+ 
+@@ -307,6 +312,22 @@ bool Runtime::SetupVfs() {
+   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+   auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+       mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  if (REXCVAR_GET(mods_enabled)) {
++    std::filesystem::path mods_dir;
++    if (!REXCVAR_GET(mods_root).empty()) {
++      mods_dir = rex::to_path(REXCVAR_GET(mods_root));
++    } else {
++      // Portable layout: ..\mods next to the exe's folder, if it exists.
++      auto portable_mods = (rex::filesystem::GetExecutableFolder() / ".." / "mods").lexically_normal();
++      std::error_code mods_ec;
++      if (std::filesystem::is_directory(portable_mods, mods_ec))
++        mods_dir = portable_mods;
++    }
++    if (!mods_dir.empty())
++      device->set_overlay_path(std::filesystem::absolute(mods_dir));
++  } else {
++    REXSYS_INFO("Mods overlay disabled (mods_enabled = false)");
++  }
+   if (!device->Initialize()) {
+     REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
+     return false;
+@@ -350,9 +371,27 @@ bool Runtime::SetupVfs() {
+     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
+   }
+ 
+-  // NOTE: Do NOT register a device for cache: paths
+-  // Games handle "device not found" gracefully but don't handle actual device
+-  // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
++  // Give title-level scratch devices a real writable backing store. Many games
++  // tolerate missing CACHE:/PHOTO:, but some use them for save/load probes.
++  const auto scratch_root = std::filesystem::absolute(
++      cache_root_.empty() ? (user_data_root_ / "cache") : cache_root_);
++
++  auto mount_scratch_device = [&](const std::string_view guest_name,
++                                  const std::string_view device_path,
++                                  const std::filesystem::path& host_path) {
++    auto scratch_device =
++        std::make_unique<rex::filesystem::HostPathDevice>(device_path, host_path, false);
++    if (!scratch_device->Initialize()) {
++      REXSYS_WARN("  Failed to mount {} scratch at {}", guest_name, host_path.string());
++      return;
++    }
++    file_system_->RegisterDevice(std::move(scratch_device));
++    file_system_->RegisterSymbolicLink(guest_name, device_path);
++    REXSYS_INFO("  Mounted {} scratch at {}", guest_name, host_path.string());
++  };
++
++  mount_scratch_device("cache:", "\\Device\\Cache0", scratch_root / "xbox_cache");
++  mount_scratch_device("photo:", "\\Device\\Photo0", scratch_root / "photo");
+ 
+   return true;
+ }
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index bd6c797..860f28b 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -38,6 +38,31 @@ static const char* kGameContentHeaderDirName = "Headers";
+ 
+ static int content_device_id_ = 0;
+ 
++static bool ShouldSeedEmptySaveFile(const XCONTENT_AGGREGATE_DATA& data) {
++  return data.content_type == XContentType::kSavedGame && data.file_name() == "Game Play Data";
++}
++
++static X_RESULT SeedEmptySaveFileIfMissing(const std::filesystem::path& package_path,
++                                           const XCONTENT_AGGREGATE_DATA& data) {
++  if (!ShouldSeedEmptySaveFile(data)) {
++    return X_ERROR_SUCCESS;
++  }
++
++  auto file_path = package_path / "savegame.txt";
++  if (std::filesystem::exists(file_path)) {
++    return X_ERROR_SUCCESS;
++  }
++
++  std::error_code ec;
++  std::filesystem::create_directories(file_path.parent_path(), ec);
++  if (ec) {
++    return X_ERROR_ACCESS_DENIED;
++  }
++
++  REXSYS_DEBUG("XContent seed file: file='{}', path={}", data.file_name(), file_path.string());
++  return rex::filesystem::CreateEmptyFile(file_path) ? X_ERROR_SUCCESS : X_ERROR_ACCESS_DENIED;
++}
++
+ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
+                                const XCONTENT_AGGREGATE_DATA& data,
+                                const std::filesystem::path& package_path)
+@@ -156,8 +181,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+     }
+ 
+     XCONTENT_AGGREGATE_DATA content_data;
+-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
+-                                         content_type, content_data))) {
++    // X_RESULT error codes like X_ERROR_FILE_NOT_FOUND (2) pass XSUCCEEDED, which would hand
++    // the game an uninitialized entry for packages without a header (e.g. installed DLC).
++    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
++                              content_data) == X_ERROR_SUCCESS) {
+       result.emplace_back(std::move(content_data));
+     } else {
+       content_data.device_id = device_id;
+@@ -202,6 +229,11 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+   auto parent_path = header_path.parent_path();
+ 
++  REXSYS_DEBUG(
++      "XContent header write: xuid={:016X}, type={:08X}, file='{}', path={}", used_xuid,
++      static_cast<uint32_t>(static_cast<XContentType>(data.content_type)), data.file_name(),
++      header_path.string());
++
+   if (!std::filesystem::exists(parent_path)) {
+     if (!std::filesystem::create_directories(parent_path)) {
+       return X_ERROR_ACCESS_DENIED;
+@@ -256,7 +288,8 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+ }
+ 
+ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
+-                                       const XCONTENT_AGGREGATE_DATA& data) {
++                                       const XCONTENT_AGGREGATE_DATA& data,
++                                       bool seed_save_file) {
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     if (open_packages_.count(string::string_key_case(root_name))) {
+@@ -265,12 +298,21 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
++  REXSYS_DEBUG("XContent create: xuid={:016X}, type={:08X}, file='{}', path={}", xuid,
++               static_cast<uint32_t>(static_cast<XContentType>(data.content_type)),
++               data.file_name(), package_path.string());
+   if (std::filesystem::exists(package_path)) {
+     return X_ERROR_ALREADY_EXISTS;
+   }
+   if (!std::filesystem::create_directories(package_path)) {
+     return X_ERROR_ACCESS_DENIED;
+   }
++  if (seed_save_file) {
++    auto seed_result = SeedEmptySaveFileIfMissing(package_path, data);
++    if (XFAILED(seed_result)) {
++      return seed_result;
++    }
++  }
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+ 
+@@ -286,7 +328,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+ 
+ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
+                                      const XCONTENT_AGGREGATE_DATA& data,
+-                                     uint32_t& content_license) {
++                                     uint32_t& content_license, bool seed_save_file) {
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     if (open_packages_.count(string::string_key_case(root_name))) {
+@@ -295,9 +337,18 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
++  REXSYS_DEBUG("XContent open: xuid={:016X}, type={:08X}, file='{}', path={}", xuid,
++               static_cast<uint32_t>(static_cast<XContentType>(data.content_type)),
++               data.file_name(), package_path.string());
+   if (!std::filesystem::exists(package_path)) {
+     return X_ERROR_FILE_NOT_FOUND;
+   }
++  if (seed_save_file) {
++    auto seed_result = SeedEmptySaveFileIfMissing(package_path, data);
++    if (XFAILED(seed_result)) {
++      return seed_result;
++    }
++  }
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+@@ -373,6 +424,9 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
++  REXSYS_DEBUG("XContent delete: xuid={:016X}, type={:08X}, file='{}', path={}", xuid,
++               static_cast<uint32_t>(static_cast<XContentType>(data.content_type)),
++               data.file_name(), package_path.string());
+   std::error_code ec;
+   auto dir_removed = std::filesystem::remove_all(package_path, ec);
+   if (ec) {
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..dca5213 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -35,6 +35,35 @@ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D
+ 
+ namespace rex::ui::d3d12 {
+ 
++namespace {
++
++const char* GetDeviceRemovedReasonName(HRESULT reason) {
++  switch (reason) {
++    case DXGI_ERROR_DEVICE_HUNG:
++      return "DEVICE_HUNG (TDR - GPU command took too long)";
++    case DXGI_ERROR_DEVICE_REMOVED:
++      return "DEVICE_REMOVED (driver internal error or hot-unplug)";
++    case DXGI_ERROR_DEVICE_RESET:
++      return "DEVICE_RESET (bad GPU command)";
++    case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
++      return "DRIVER_INTERNAL_ERROR";
++    case DXGI_ERROR_INVALID_CALL:
++      return "INVALID_CALL";
++    default:
++      return "Unknown";
++  }
++}
++
++void LogPresentDeviceLoss(ID3D12Device* device, HRESULT present_result) {
++  HRESULT removed_reason = device ? device->GetDeviceRemovedReason() : present_result;
++  REXLOG_ERROR(
++      "D3D12Presenter: Present failed with HRESULT 0x{:08X}; device removed reason 0x{:08X} - {}",
++      static_cast<unsigned>(present_result), static_cast<unsigned>(removed_reason),
++      GetDeviceRemovedReasonName(removed_reason));
++}
++
++}  // namespace
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
+@@ -1164,8 +1193,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   paint_context_.present_submission_tracker.NextSubmission();
+   switch (present_result) {
+     case DXGI_ERROR_DEVICE_REMOVED:
++      LogPresentDeviceLoss(device, present_result);
+       return PaintResult::kGpuLostExternally;
+     case DXGI_ERROR_DEVICE_RESET:
++      LogPresentDeviceLoss(device, present_result);
+       return PaintResult::kGpuLostResponsible;
+     default:
+       return SUCCEEDED(present_result) ? PaintResult::kPresented : PaintResult::kNotPresented;
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..288c6a1 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -412,6 +412,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
+   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+ 
++  ApplyGamepadInput(io);
+   ImGui::NewFrame();
+ 
+   assert_true(!IsDrawingDialogs());
+@@ -487,6 +488,61 @@ ImGuiIO& ImGuiDrawer::GetIO() {
+   return ImGui::GetIO();
+ }
+ 
++void ImGuiDrawer::SetGamepadInput(bool active, uint16_t buttons, int16_t lx, int16_t ly) {
++  uint64_t v = (uint64_t(active) << 63) | (uint64_t(buttons) << 32) |
++               (uint64_t(uint16_t(lx)) << 16) | uint64_t(uint16_t(ly));
++  gamepad_packed_.store(v, std::memory_order_relaxed);
++}
++
++void ImGuiDrawer::ApplyGamepadInput(ImGuiIO& io) {
++  uint64_t v = gamepad_packed_.load(std::memory_order_relaxed);
++  bool active = (v >> 63) != 0;
++  uint16_t buttons = active ? uint16_t(v >> 32) : 0;
++  int16_t lx = active ? int16_t((v >> 16) & 0xFFFF) : 0;
++  int16_t ly = active ? int16_t(v & 0xFFFF) : 0;
++  if (!active && !gamepad_prev_active_) {
++    return;
++  }
++  if (active) {
++    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
++  }
++  struct Map {
++    uint16_t mask;
++    ImGuiKey key;
++  };
++  static const Map kMap[] = {
++      {0x0001, ImGuiKey_GamepadDpadUp},    {0x0002, ImGuiKey_GamepadDpadDown},
++      {0x0004, ImGuiKey_GamepadDpadLeft},  {0x0008, ImGuiKey_GamepadDpadRight},
++      {0x1000, ImGuiKey_GamepadFaceDown},  // A = activate
++      {0x2000, ImGuiKey_GamepadFaceRight},  // B = cancel
++      {0x4000, ImGuiKey_GamepadFaceLeft},  {0x8000, ImGuiKey_GamepadFaceUp},
++      {0x0100, ImGuiKey_GamepadL1},        {0x0200, ImGuiKey_GamepadR1},
++  };
++  for (const auto& m : kMap) {
++    bool now = (buttons & m.mask) != 0;
++    bool was = (gamepad_prev_buttons_ & m.mask) != 0;
++    if (now != was) {
++      io.AddKeyEvent(m.key, now);
++    }
++  }
++  // Left stick -> analog nav axes (dead zone 25%).
++  auto axis = [](int16_t a, bool positive) {
++    float f = float(a) / 32767.0f;
++    f = positive ? f : -f;
++    return f > 0.25f ? (f - 0.25f) / 0.75f : 0.0f;
++  };
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, axis(lx, false) > 0, axis(lx, false));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, axis(lx, true) > 0, axis(lx, true));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, axis(ly, true) > 0, axis(ly, true));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, axis(ly, false) > 0, axis(ly, false));
++  gamepad_prev_buttons_ = buttons;
++  gamepad_prev_active_ = active;
++  if (!active) {
++    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
++  }
++}
++
+ void ImGuiDrawer::OnKeyDown(KeyEvent& e) {
+   OnKey(e, true);
+ }
+diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
+index 4ede107..051e61f 100644
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -14,18 +14,73 @@
+ #include <rex/string.h>
+ #include <rex/string/numeric.h>
+ #include <rex/ui/keybinds.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
+ #include <imgui.h>
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <chrono>
++#include <ctime>
++#include <filesystem>
++#include <initializer_list>
+ #include <map>
+ #include <set>
+ #include <string>
+ #include <vector>
+ 
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#include <shellapi.h>
++#pragma comment(lib, "shell32.lib")
++#endif
++
+ namespace rex::ui {
+ 
+-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
+-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
++namespace {
++
++// Same resolution as ReXApp: user_data_root cvar, else ..\saves next to the exe's folder.
++std::filesystem::path ResolveSavesDir() {
++  std::string cvar_path = rex::cvar::GetFlagByName("user_data_root");
++  std::error_code ec;
++  if (!cvar_path.empty())
++    return std::filesystem::path(cvar_path);
++  auto portable = (rex::filesystem::GetExecutableFolder() / ".." / "saves").lexically_normal();
++  if (std::filesystem::is_directory(portable, ec))
++    return portable;
++  return {};
++}
++
++// Copy a save folder tree, leaving out the shader cache (large, rebuilt on demand).
++bool CopySaves(const std::filesystem::path& from, const std::filesystem::path& to,
++               std::string* error) {
++  std::error_code ec;
++  std::filesystem::create_directories(to, ec);
++  for (auto& entry : std::filesystem::directory_iterator(from, ec)) {
++    if (entry.path().filename() == "cache")
++      continue;
++    std::filesystem::copy(entry.path(), to / entry.path().filename(),
++                          std::filesystem::copy_options::recursive |
++                              std::filesystem::copy_options::overwrite_existing,
++                          ec);
++    if (ec) {
++      *error = ec.message();
++      return false;
++    }
++  }
++  return true;
++}
++
++}  // namespace
++
++SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
++                               std::function<void()> on_quit)
++    : ImGuiDialog(imgui_drawer),
++      config_path_(std::move(config_path)),
++      on_quit_(std::move(on_quit)) {}
+ 
+ SettingsDialog::~SettingsDialog() {}
+ 
+@@ -156,7 +211,283 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
+   }
+ }
+ 
+-void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
++// Plain-language controls for the few settings players actually change. Every
++// change is saved to the config file right away.
++void SettingsDialog::DrawQuickSettings() {
++  struct Choice {
++    const char* label;
++    int value;
++  };
++  const float value_x = 220.0f;
++
++  auto set = [this](const char* name, const std::string& value) {
++    rex::cvar::SetFlagByName(name, value);
++    rex::cvar::SaveConfig(config_path_);
++  };
++  auto restart_note = [](const char* name) {
++    auto* info = rex::cvar::GetFlagInfo(name);
++    if (info && info->lifecycle == rex::cvar::Lifecycle::kRequiresRestart) {
++      ImGui::SameLine();
++      ImGui::TextDisabled("(applies next time you start)");
++    }
++  };
++  auto combo = [&](const char* label, const char* name, std::initializer_list<Choice> choices) {
++    if (!rex::cvar::GetFlagInfo(name))
++      return;
++    int cur = std::atoi(rex::cvar::GetFlagByName(name).c_str());
++    const char* preview = "custom";
++    for (auto& c : choices) {
++      if (c.value == cur)
++        preview = c.label;
++    }
++    ImGui::PushID(name);
++    ImGui::TextUnformatted(label);
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(230.0f);
++    if (pad_mode_) {
++      // Pad navigation: popups swallow pad input, so A cycles to the next value.
++      std::string text = std::string(preview) + "  >";
++      bool clicked = ImGui::Button((text + "##cyc").c_str(), ImVec2(230.0f, 0));
++      // D-pad right / A = next value, D-pad left = previous.
++      int step = clicked ? 1 : 0;
++      if (ImGui::IsItemFocused()) {
++        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight))
++          step = 1;
++        else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft))
++          step = -1;
++      }
++      if (step != 0) {
++        int idx = 0, n = 0;
++        for (auto& c : choices) {
++          if (c.value == cur)
++            idx = n;
++          ++n;
++        }
++        int target = (idx + step + n) % n, k = 0;
++        for (auto& c : choices) {
++          if (k++ == target)
++            set(name, std::to_string(c.value));
++        }
++      }
++    } else if (ImGui::BeginCombo("##q", preview)) {
++      for (auto& c : choices) {
++        if (ImGui::Selectable(c.label, c.value == cur))
++          set(name, std::to_string(c.value));
++      }
++      ImGui::EndCombo();
++    }
++    restart_note(name);
++    ImGui::PopID();
++  };
++  auto checkbox = [&](const char* label, const char* name) {
++    if (!rex::cvar::GetFlagInfo(name))
++      return;
++    bool v = rex::string::from_string<bool>(rex::cvar::GetFlagByName(name), false);
++    ImGui::PushID(name);
++    ImGui::TextUnformatted(label);
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &v))
++      set(name, v ? "true" : "false");
++    restart_note(name);
++    ImGui::PopID();
++  };
++
++  ImGui::TextColored(imgui_drawer()->style().settings.warning, "Quick settings");
++  ImGui::TextDisabled("Changes save automatically.");
++  ImGui::Spacing();
++  combo("Render resolution", "resolution_scale",
++        {{"720p (original)", 1},
++         {"1440p", 2},
++         {"4K (2160p)", 3},
++         {"5K (2880p)", 4},
++         {"6K (3600p)", 5},
++         {"8K (4320p), sharpest on a 4K screen", 6}});
++  {
++    auto* info = rex::cvar::GetFlagInfo("gpu_backend");
++    if (info) {
++      const std::string cur = rex::cvar::GetFlagByName("gpu_backend");
++      ImGui::PushID("gpu_backend");
++      ImGui::TextUnformatted("Graphics backend");
++      ImGui::SameLine(value_x);
++      ImGui::SetNextItemWidth(230.0f);
++      if (ImGui::BeginCombo("##q", cur == "vulkan" ? "Vulkan" : "Direct3D 12 (experimental, untested)")) {
++        if (ImGui::Selectable("Direct3D 12 (experimental, untested)", cur != "vulkan"))
++          set("gpu_backend", "d3d12");
++        if (ImGui::Selectable("Vulkan", cur == "vulkan"))
++          set("gpu_backend", "vulkan");
++        ImGui::EndCombo();
++      }
++      restart_note("gpu_backend");
++      ImGui::PopID();
++    }
++  }
++  if (rex::cvar::GetFlagInfo("present_effect") &&
++      rex::cvar::GetFlagInfo("present_cas_additional_sharpness")) {
++    const std::string eff = rex::cvar::GetFlagByName("present_effect");
++    const double cur = std::atof(rex::cvar::GetFlagByName("present_cas_additional_sharpness").c_str());
++    struct Level {
++      const char* label;
++      double v;
++    };
++    static const Level levels[] = {{"Low", 0.2}, {"Medium", 0.5}, {"High", 0.8}, {"Max", 1.0}};
++    int cur_idx = 0;
++    double best = 1e9;
++    for (int i = 0; i < 4; ++i) {
++      if (std::abs(levels[i].v - cur) < best) {
++        best = std::abs(levels[i].v - cur);
++        cur_idx = i;
++      }
++    }
++    // Entries: 0 = Off, 1..4 = CAS at each level.
++    int cur_entry = eff == "cas" ? 1 + cur_idx : 0;
++    ImGui::PushID("sharpening");
++    ImGui::TextUnformatted("Sharpening (CAS)");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(230.0f);
++    auto entry_label = [&](int e) -> std::string {
++      return e == 0 ? "Off" : std::string("CAS, ") + levels[e - 1].label;
++    };
++    auto apply = [&](int e) {
++      if (e == 0) {
++        rex::cvar::SetFlagByName("present_effect", "bilinear");
++      } else {
++        rex::cvar::SetFlagByName("present_effect", "cas");
++        rex::cvar::SetFlagByName("present_cas_additional_sharpness", std::to_string(levels[e - 1].v));
++      }
++      rex::cvar::SaveConfig(config_path_);
++    };
++    if (pad_mode_) {
++      bool clicked = ImGui::Button((entry_label(cur_entry) + "  >##cyc").c_str(), ImVec2(230.0f, 0));
++      int step = clicked ? 1 : 0;
++      if (ImGui::IsItemFocused()) {
++        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight))
++          step = 1;
++        else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft))
++          step = -1;
++      }
++      if (step != 0)
++        apply((cur_entry + step + 5) % 5);
++    } else if (ImGui::BeginCombo("##q", entry_label(cur_entry).c_str())) {
++      for (int e = 0; e < 5; ++e) {
++        if (ImGui::Selectable(entry_label(e).c_str(), e == cur_entry))
++          apply(e);
++      }
++      ImGui::EndCombo();
++    }
++    restart_note("present_effect");
++    ImGui::PopID();
++  }
++  checkbox("Fullscreen (F11)", "fullscreen");
++  checkbox("VSync (no screen tearing)", "vsync");
++  combo("Texture sharpness", "anisotropic_override",
++        {{"Off", 0}, {"4x", 3}, {"8x", 4}, {"16x (best)", 5}});
++  combo("Glow (bloom)", "bloom", {{"Off", 0}, {"Reduced", 1}, {"Original", 2}});
++  checkbox("Mute and ignore pad when unfocused", "pause_on_focus_loss");
++  checkbox("Load mods folder", "mods_enabled");
++  checkbox("Unlock everything", "unlock_all");
++  checkbox("Infinite money", "infinite_money");
++
++  {
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Saves");
++    const auto saves = ResolveSavesDir();
++    if (saves.empty()) {
++      ImGui::TextDisabled("Saves folder not found.");
++    } else {
++      const auto backups = (saves.parent_path() / "save-backups");
++      if (ImGui::Button("Back up saves")) {
++        confirm_restore_ = false;
++        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
++        std::tm tm_buf{};
++#ifdef _WIN32
++        localtime_s(&tm_buf, &now);
++#else
++        localtime_r(&now, &tm_buf);
++#endif
++        char stamp[32];
++        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tm_buf);
++        std::string err;
++        if (CopySaves(saves, backups / stamp, &err)) {
++          save_status_ = std::string("Backed up to save-backups\\") + stamp;
++        } else {
++          save_status_ = "Backup failed: " + err;
++        }
++        REXLOG_INFO("Saves: {}", save_status_);
++      }
++      ImGui::SameLine();
++      if (ImGui::Button("Restore latest"))
++        confirm_restore_ = true;
++      ImGui::SameLine();
++      if (ImGui::Button("Open saves folder")) {
++#ifdef _WIN32
++        ShellExecuteW(nullptr, L"open", saves.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#endif
++      }
++      if (confirm_restore_) {
++        std::filesystem::path latest;
++        std::error_code ec;
++        for (auto& e : std::filesystem::directory_iterator(backups, ec)) {
++          if (e.is_directory(ec) && (latest.empty() || e.path().filename() > latest.filename()))
++            latest = e.path();
++        }
++        if (latest.empty()) {
++          save_status_ = "No backups found.";
++          confirm_restore_ = false;
++        } else {
++          ImGui::TextColored(imgui_drawer()->style().settings.warning,
++                             "Overwrite current saves with %s?", latest.filename().string().c_str());
++          if (ImGui::Button("Yes, restore")) {
++            std::string err;
++            if (CopySaves(latest, saves, &err))
++              save_status_ = "Restored " + latest.filename().string() +
++                             " (go back to the title screen and reload)";
++            else
++              save_status_ = "Restore failed: " + err;
++            REXLOG_INFO("Saves: {}", save_status_);
++            confirm_restore_ = false;
++          }
++          ImGui::SameLine();
++          if (ImGui::Button("Cancel"))
++            confirm_restore_ = false;
++        }
++      }
++      if (!save_status_.empty())
++        ImGui::TextDisabled("%s", save_status_.c_str());
++    }
++  }
++
++  if (on_quit_) {
++    ImGui::Spacing();
++    if (ImGui::Button("Quit game", ImVec2(140.0f, 0)))
++      on_quit_();
++    ImGui::SameLine();
++    ImGui::TextDisabled("F4 closes this menu");
++  }
++  ImGui::Spacing();
++}
++
++void SettingsDialog::OnDraw(ImGuiIO& io) {
++  if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f || io.MouseClicked[0]) {
++    pad_mode_ = false;
++  } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown) ||
++             ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp) ||
++             ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown)) {
++    pad_mode_ = true;
++  }
++  // B closes the menu, unless it just closed a combo popup.
++  if ((ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
++       ImGui::IsKeyPressed(ImGuiKey_Escape, false)) &&
++      !popup_open_prev_ && !io.WantTextInput && on_close_) {
++    on_close_();
++  }
++  struct PopupTracker {
++    bool& flag;
++    ~PopupTracker() {
++      flag = ImGui::IsPopupOpen(nullptr,
++                                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
++    }
++  } popup_tracker{popup_open_prev_};
++
+   auto& registry = rex::cvar::GetRegistry();
+ 
+   // Collect sorted unique category paths.
+@@ -199,13 +530,19 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+   const std::string search(search_buf_);
+   const bool searching = !search.empty();
+ 
+-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowSize(ImVec2(680, 620), ImGuiCond_FirstUseEver);
+   ImGui::SetNextWindowBgAlpha(0.85f);
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();
+     return;
+   }
+ 
++  DrawQuickSettings();
++  if (!ImGui::CollapsingHeader("All engine settings (advanced)")) {
++    ImGui::End();
++    return;
++  }
++
+   // Search bar at the top (full width).
+   ImGui::SetNextItemWidth(-1.0f);
+   ImGui::InputText("##search", search_buf_, sizeof(search_buf_));
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..1a80336 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -105,6 +105,13 @@ bool ReXApp::OnInitialize() {
+ bool ReXApp::SetupEnvironment() {
+   auto exe_dir = rex::filesystem::GetExecutableFolder();
+ 
++  // Load the default config before resolving paths so path cvars set in the TOML
++  // (user_data_root etc.) apply when the exe is launched without command-line flags.
++  // Command-line values still outrank the file.
++  auto default_config_path = exe_dir / (std::string(GetName()) + ".toml");
++  if (std::filesystem::exists(default_config_path))
++    rex::cvar::LoadConfig(default_config_path);
++
+   std::filesystem::path game_dir;
+   std::string game_data_cvar = REXCVAR_GET(game_data_root);
+   if (!game_data_cvar.empty()) {
+@@ -117,7 +124,13 @@ bool ReXApp::SetupEnvironment() {
+   if (!user_data_cvar.empty()) {
+     user_dir = user_data_cvar;
+   } else {
+-    user_dir = rex::filesystem::GetUserFolder() / GetName();
++    // Portable layout: saves live in ..\saves next to the exe's folder when it exists.
++    auto portable_saves = (exe_dir / ".." / "saves").lexically_normal();
++    std::error_code portable_ec;
++    if (std::filesystem::is_directory(portable_saves, portable_ec))
++      user_dir = portable_saves;
++    else
++      user_dir = rex::filesystem::GetUserFolder() / GetName();
+   }
+ 
+   // Update data: cvar override, or empty (opt-in)
+@@ -256,6 +269,26 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+           return true;
+         return !imgui_drawer_->GetIO().WantCaptureMouse;
+       });
++      // Pad: Back+Start toggles the F4 overlay; while it is open the pad drives
++      // the overlay (ImGui nav) and is hidden from the game.
++      input_sys->SetPadHook([this](const rex::input::X_INPUT_GAMEPAD& pad) {
++        const uint16_t b = pad.buttons;
++        constexpr uint16_t kCombo =
++            rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
++        const bool combo = (b & kCombo) == kCombo;
++        const bool was_combo = pad_combo_down_.exchange(combo);
++        if (combo && !was_combo && toggle_settings_) {
++          REXLOG_INFO("Pad: Back+Start toggles settings overlay");
++          app_context().CallInUIThreadDeferred([this] { toggle_settings_(); });
++        }
++        const bool open = settings_overlay_ != nullptr;
++        if (open) {
++          imgui_drawer_->SetGamepadInput(true, combo ? 0 : b, pad.thumb_lx, pad.thumb_ly);
++        }
++        // Hide the pad while open and while the combo is held (so the game
++        // never sees Back/Start of the toggle press).
++        return open || combo;
++      });
+     }
+   }
+ 
+@@ -409,12 +442,37 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+     }
+   });
+-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
++  toggle_settings_ = [this] {
+     if (settings_overlay_) {
+       settings_overlay_.reset();
++      imgui_drawer_->SetGamepadInput(false, 0, 0, 0);
+     } else {
+-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
++      settings_overlay_ =
++          std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_, [this] {
++            // Deferred so the window isn't closed in the middle of drawing the overlay.
++            app_context().CallInUIThreadDeferred([this] {
++              if (window_) {
++                window_->RequestClose();
++              }
++            });
++          });
++      settings_overlay_->set_on_close([this] {
++        // Deferred: the dialog must not be destroyed while it is drawing.
++        app_context().CallInUIThreadDeferred([this] {
++          if (settings_overlay_) {
++            REXLOG_INFO("Pad: B closes settings overlay");
++            settings_overlay_.reset();
++            imgui_drawer_->SetGamepadInput(false, 0, 0, 0);
++          }
++        });
++      });
+     }
++  };
++  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay",
++                        [this] { toggle_settings_(); });
++  rex::ui::RegisterBind("bind_fullscreen", "F11", "Toggle borderless fullscreen", [] {
++    const bool now = rex::string::from_string<bool>(rex::cvar::GetFlagByName("fullscreen"), false);
++    rex::cvar::SetFlagByName("fullscreen", now ? "false" : "true");
+   });
+   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+     if (achievements_overlay_) {
+@@ -561,6 +619,7 @@ void ReXApp::OnDestroy() {
+   rex::ui::UnregisterBind("bind_debug_overlay");
+   rex::ui::UnregisterBind("bind_console");
+   rex::ui::UnregisterBind("bind_settings");
++  rex::ui::UnregisterBind("bind_fullscreen");
+   rex::ui::UnregisterBind("bind_achievements");
+ 
+   // ImGui cleanup (reverse of setup)

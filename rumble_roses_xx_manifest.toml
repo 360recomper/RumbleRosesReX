@@ -2,13 +2,20 @@
 
 [project]
 name = "rumble_roses_xx"
-sdk_version = "0.8.1.4"
+sdk_version = "0.10.0"
 game_root = "assets"
 
 [entrypoint]
 file_path = "assets/default.xex"
 out_directory_path = "generated/default"
 includes = []
+
+# Guest CRT setjmp/longjmp. Without these, a guest longjmp (used by the scene
+# script system around 0x822E5320 when the attract demo ends) just reloads
+# registers and returns to its host caller instead of the setjmp site,
+# leaving a foreign r1/r14-r31 that later crashes or corrupts state.
+setjmp_address = 0x824726C0
+longjmp_address = 0x82472470
 
 # Manual function seeds required by the current ReXGlue analyzer for this title.
 # These are direct branch targets that are valid code but were not discovered
@@ -46,3 +53,490 @@ name = "sub_822156F0"
 
 [entrypoint.functions."822156E8"]
 name = "sub_822156E8"
+
+# Statically-discovered indirect call targets (added 2026-10-09).
+# Code pointers found in vtables (.rdata) or built via lis+addi in code that sit
+# on a clean function boundary but were not registered by the analyzer
+# (mostly prologue-less leaf/adjustor thunks merged into the previous function).
+# (Address list produced by runtime tracing of the game.)
+[entrypoint.functions."8207F3C0"]  # vtable ref @ 820037FC
+name = "sub_8207F3C0"
+
+[entrypoint.functions."8212CAE8"]  # vtable ref @ 8200A748
+name = "sub_8212CAE8"
+
+[entrypoint.functions."821302F0"]  # vtable ref @ 8200C244
+name = "sub_821302F0"
+
+[entrypoint.functions."82137030"]  # vtable ref @ 8200D080, 8200D510
+name = "sub_82137030"
+
+[entrypoint.functions."82153D48"]  # vtable ref @ 82010394
+name = "sub_82153D48"
+
+[entrypoint.functions."821D2928"]  # address-taken ref @ 821D33AC
+name = "sub_821D2928"
+
+[entrypoint.functions."821D2948"]  # address-taken ref @ 821D33B4
+name = "sub_821D2948"
+
+[entrypoint.functions."822FE600"]  # address-taken ref @ 822FE638
+name = "sub_822FE600"
+
+[entrypoint.functions."8232C890"]  # address-taken ref @ 8232D48C
+name = "sub_8232C890"
+
+[entrypoint.functions."8232C8A0"]  # address-taken ref @ 8232D498
+name = "sub_8232C8A0"
+
+[entrypoint.functions."82347C48"]  # vtable ref @ 820274BC, 820275A4
+name = "sub_82347C48"
+
+[entrypoint.functions."82347C50"]  # vtable ref @ 820274C0, 820275A8
+name = "sub_82347C50"
+
+[entrypoint.functions."82347C58"]  # vtable ref @ 820274C4, 820275AC
+name = "sub_82347C58"
+
+[entrypoint.functions."82347C60"]  # vtable ref @ 8202745C
+name = "sub_82347C60"
+
+[entrypoint.functions."82347C88"]  # vtable ref @ 8202747C, 82027564
+name = "sub_82347C88"
+
+[entrypoint.functions."82347C90"]  # vtable ref @ 82027480
+name = "sub_82347C90"
+
+[entrypoint.functions."82347CA0"]  # vtable ref @ 82027488
+name = "sub_82347CA0"
+
+[entrypoint.functions."82347CB0"]  # vtable ref @ 82027490
+name = "sub_82347CB0"
+
+[entrypoint.functions."82349808"]  # vtable ref @ 82027544
+name = "sub_82349808"
+
+[entrypoint.functions."82349810"]  # vtable ref @ 82027568
+name = "sub_82349810"
+
+[entrypoint.functions."82360828"]  # vtable ref @ 820271E0, 82027224, 820274A8
+name = "sub_82360828"
+
+[entrypoint.functions."8236BBB0"]  # vtable ref @ 8202AC3C, 8202ACC4, 8202AD4C
+name = "sub_8236BBB0"
+
+[entrypoint.functions."823786A0"]  # vtable ref @ 8202BD98, 8202BDC4
+name = "sub_823786A0"
+
+[entrypoint.functions."82386880"]  # vtable ref @ 8202CF24, 8202CF7C
+name = "sub_82386880"
+
+[entrypoint.functions."82388820"]  # vtable ref @ 8202CF90
+name = "sub_82388820"
+
+[entrypoint.functions."82388840"]  # vtable ref @ 8202CF88
+name = "sub_82388840"
+
+[entrypoint.functions."82388A30"]  # vtable ref @ 8202CFD8
+name = "sub_82388A30"
+
+[entrypoint.functions."82388A50"]  # vtable ref @ 8202CFDC
+name = "sub_82388A50"
+
+[entrypoint.functions."82388A70"]  # vtable ref @ 8202CFE0
+name = "sub_82388A70"
+
+[entrypoint.functions."82388A90"]  # vtable ref @ 8202CFE4
+name = "sub_82388A90"
+
+[entrypoint.functions."82388AB0"]  # vtable ref @ 8202CFE8
+name = "sub_82388AB0"
+
+[entrypoint.functions."82388AD0"]  # vtable ref @ 8202CFEC
+name = "sub_82388AD0"
+
+[entrypoint.functions."82388AF0"]  # vtable ref @ 8202CFF0
+name = "sub_82388AF0"
+
+[entrypoint.functions."82388B10"]  # vtable ref @ 8202CFF4
+name = "sub_82388B10"
+
+[entrypoint.functions."82388B30"]  # vtable ref @ 8202CFF8
+name = "sub_82388B30"
+
+[entrypoint.functions."82388B50"]  # vtable ref @ 8202CFFC
+name = "sub_82388B50"
+
+[entrypoint.functions."8238F0E8"]  # vtable ref @ 8202CF14, 8202CF64
+name = "sub_8238F0E8"
+
+[entrypoint.functions."824628D8"]  # vtable ref @ 824628FC, 82046154
+name = "sub_824628D8"
+
+# Bloom passes. sub_8226BB90 queues post-process passes via sub_821E96A8 with
+# r6 = enabled. These are the two bloom passes from the community xenia patch
+# ("Bloom Slight Off 1/2"); the hooks clear r6 when the bloom setting asks.
+[[entrypoint.midasm_hook]]
+address = 0x8226C12C  # li r6,1 before pass 10
+name = "RRXX_BloomPass1"
+registers = ["r6"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8226C150  # li r6,1 before pass 11
+name = "RRXX_BloomPass2"
+registers = ["r6"]
+after_instruction = true
+
+# Blur passes from the community "Blur Off" patch. Its be32 write at 0x8226DE12
+# is misaligned (half of fmr f1,f31 + half of the bl); the intent is skipping
+# the bl at 0x8226DE14, done here with a conditional jump instead.
+[[entrypoint.midasm_hook]]
+address = 0x8226BF20  # li r6,1 before pass 18
+name = "RRXX_BlurPass"
+registers = ["r6"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8226C0A4  # li r6,1 before pass 13
+name = "RRXX_BlurPass"
+registers = ["r6"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8226DE14  # bl 0x821e92c8 in sub_8226DC50
+name = "RRXX_SkipBlurQuad"
+jump_address_on_true = 0x8226DE18
+
+# Cheats (unlock_all / infinite_money settings). sub_8216DFA0 is the game data
+# getter; patch the data on entry, before the caller reads it.
+[[entrypoint.midasm_hook]]
+address = 0x8216DFA0  # lis r11,-32138 (first instruction)
+name = "RRXX_ApplyCheats"
+
+# Cut content / debug.
+# sub_822607D8 (event scene, vtable 0x820196C0 slot 6) asks slot 11 whether an
+# event is queued (global 0x82A8A31C) and plays it; if not, slot 13
+# (sub_82260ED8) opens the leftover event debug menu (sub_8229A500 /
+# sub_822AC4F0: "[Play The Event Movie]", "[Edit Event Cast & Stage]", ...).
+# The hook clears r3 before the "cmpwi cr6,r3,0" so the debug branch is taken.
+[[entrypoint.midasm_hook]]
+address = 0x822607FC  # cmpwi cr6,r3,0 after bctrl to slot 11
+name = "RRXX_DebugEventMenu"
+registers = ["r3"]
+
+# sub_82092238(path, out) turns an archive path ("/MENU/MAPL", ...) into a
+# lookup key. Logs each distinct path when log_asset_paths is on.
+[[entrypoint.midasm_hook]]
+address = 0x82092238  # std r30,-16(r1) (first instruction)
+name = "RRXX_LogAssetPath"
+registers = ["r3"]
+
+# Created wrestlers ("Lambda"). A character model is a
+# composite of up to 16 parts; menus, Locker Room, character select and
+# Customize add each part through sub_82180760(composite, slot, id, kind,
+# variant). Matches reuse the model built on the select screen.
+# RRXX_LambdaPart applies the lambda_model_overrides setting (re-points a
+# Lambda slot's parts to a DLC costume id) and returns true to skip a part.
+# r12 = caller (hook sits after "mflr r12"); r21 = sub_82180920's loader.
+# The other hooks only log when log_lambda_parts is on.
+[[entrypoint.midasm_hook]]
+address = 0x82180760  # mflr r12 (first instruction)
+name = "RRXX_LambdaPart"
+registers = ["r3", "r4", "r5", "r6", "r7", "r12", "r21"]
+after_instruction = true
+return_on_true = true
+
+# DV-3: stock model codes for DLC hair / head parts (see RRXX_LambdaDlcPartCode).
+[[entrypoint.midasm_hook]]
+address = 0x8220B258  # stw r9,1140(r31): r9 = code from the CEditDLLoader, r31 = part
+name = "RRXX_LambdaDlcPartCode"
+registers = ["r9", "r31"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82216F40  # mflr r12 (first instruction)
+name = "RRXX_LogPartB"
+registers = ["r3", "r4", "r5", "r6", "r7", "r12"]
+after_instruction = true  # r12 = caller
+
+[[entrypoint.midasm_hook]]
+address = 0x822091E8  # mflr r12: part model ctor (this, id, kind, variant)
+name = "RRXX_LogPartCtor"
+registers = ["r4", "r5", "r6", "r12"]
+after_instruction = true  # r12 = caller
+
+[[entrypoint.midasm_hook]]
+address = 0x82217D88  # mflr r12: builder G copies save record (mode, idx) to G+8600
+name = "RRXX_LogRecordLoadG"
+registers = ["r3", "r4", "r5"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82180018  # mflr r12: edit loader copies save record (mode, idx) to +28
+name = "RRXX_LogRecordLoadEdit"
+registers = ["r3", "r4", "r5"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82212EC8  # mflr r12: built-in body base (composite, char)
+name = "RRXX_LogBodyBuiltin"
+registers = ["r3", "r4", "r5", "r6"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82213160  # mflr r12: Lambda body base (composite, skin/eye/lip/make-up)
+name = "RRXX_LogBodyLambda"
+registers = ["r3", "r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82212BC0  # mflr r12: Lambda body base, all presets
+name = "RRXX_LogBodyLambdaAll"
+registers = ["r3"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82279980  # mflr r12: DLC part file open (id, kind)
+name = "RRXX_LogDlcPart"
+registers = ["r3", "r4", "r12"]
+after_instruction = true  # r12 = caller
+
+[[entrypoint.midasm_hook]]
+address = 0x822151F0  # mflr r12: Customize writes G+8600 back to save record (mode, idx)
+name = "RRXX_LogRecordSaveG"
+registers = ["r3", "r4", "r5"]
+
+# DV-3 diagnostics (log_lambda_parts): loader state changes + part raw-data hashes,
+# and the buffer each CEditDLLoader file read allocates.
+[[entrypoint.midasm_hook]]
+address = 0x82180920  # mflr r12: select / Locker Room loader tick (loader)
+name = "RRXX_LogLockerTick"
+registers = ["r3"]
+
+[[entrypoint.midasm_hook]]
+address = 0x8227A5D0  # lwz r11,1244(r31): r3 = new read buffer, r31 = CEditDLLoader
+name = "RRXX_LogDlcRead"
+registers = ["r3", "r31"]
+
+# Exhibition stage select (setting
+# exhibition_stages). The picker was built for 3 stages; these hooks replace the
+# fixed list. All are no-ops while the setting is empty.
+[[entrypoint.midasm_hook]]
+address = 0x8214CAC8  # lwz r11,144(r3): cursor -> stage id (leaf)
+name = "RRXX_StageFromCursor"
+registers = ["r3"]
+return_on_true = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8214CA80  # cmpwi cr6,r4,0: stage id -> cursor (leaf)
+name = "RRXX_CursorFromStage"
+registers = ["r3", "r4"]
+return_on_true = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8214D100  # bne after "cmpwi r10,2 / stw r11,200(r31)": right wraps at 2
+name = "RRXX_StageNext"
+registers = ["r10", "r31"]
+jump_address_on_true = 0x8214D19C
+
+[[entrypoint.midasm_hook]]
+address = 0x8214D12C  # bne after "cmpwi r10,0 / stw r7,200(r31)": left wraps to 2
+name = "RRXX_StagePrev"
+registers = ["r10", "r31"]
+jump_address_on_true = 0x8214D19C
+
+[[entrypoint.midasm_hook]]
+address = 0x8214CBB8  # li r5,3: list count passed to sub_821D27B0
+name = "RRXX_StageCount"
+registers = ["r5"]
+after_instruction = true
+
+# AR-10: imported stage ids (>= 12) are stored as 0 so game logic takes the Arena
+# paths (the EDIT sepia entrance filter stayed on); only the stage file load gets
+# the real id. One hook after every game write of the stage byte (game data +0x160).
+[[entrypoint.midasm_hook]]
+address = 0x820E3700  # stb rX,352(game data): sub_820E3318 match setup
+name = "RRXX_StageIdWritten_820E3700"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x820E5DBC  # stb rX,352(game data): sub_820E5B50 game data reset
+name = "RRXX_StageIdWritten_820E5DBC"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82133630  # stb rX,352(game data): sub_821334C0 story match
+name = "RRXX_StageIdWritten_82133630"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82295BD0  # stb rX,352(game data): sub_82295AF8
+name = "RRXX_StageIdWritten_82295BD0"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82297020  # stb rX,352(game data): sub_82296F88 (9)
+name = "RRXX_StageIdWritten_82297020"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8229A3E0  # stb rX,352(game data): sub_8229A290
+name = "RRXX_StageIdWritten_8229A3E0"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8229A5C0  # stb rX,352(game data): sub_8229A560 (0)
+name = "RRXX_StageIdWritten_8229A5C0"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822A4890  # stb rX,352(game data): sub_822A4670
+name = "RRXX_StageIdWritten_822A4890"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822A9910  # stb rX,352(game data): sub_822A98B8
+name = "RRXX_StageIdWritten_822A9910"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822ABDF4  # stb rX,352(game data): sub_822ABD98
+name = "RRXX_StageIdWritten_822ABDF4"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822ABEF4  # stb rX,352(game data): sub_822ABEC0
+name = "RRXX_StageIdWritten_822ABEF4"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822ABFBC  # stb rX,352(game data): sub_822ABF78 (+=)
+name = "RRXX_StageIdWritten_822ABFBC"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822AC478  # stb rX,352(game data): sub_822AC3A0
+name = "RRXX_StageIdWritten_822AC478"
+registers = []
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82156D2C  # bl sub_821E25F0: stage file existence check (r4 = id)
+name = "RRXX_StageFileId"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82156D60  # bl sub_821E2420: "/STG/%04d" load (r4 = id)
+name = "RRXX_StageFileId"
+registers = ["r4"]
+
+# Game heaps (FS-CAP, src/title_hooks.cpp). Heap 7 (33 MiB) holds the m.pac MOT/GAME
+# pack; heap_block_extra_mb grows the heap block (FS-CAP2) and mot_heap_mb / the extra
+# go to heap 7 via a new size table.
+[[entrypoint.midasm_hook]]
+address = 0x820618DC  # sub_82061828: lis r3,3488 (3rd sub_82065DC8: heap block size/min)
+name = "RRXX_HeapBlockAlloc"
+registers = ["r3", "r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x820618E4  # mr r31,r3 (heap block address)
+name = "RRXX_HeapBlockGot"
+registers = ["r31"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x820618EC  # lis r4,3488 (clear size for sub_82307FE8)
+name = "RRXX_HeapBlockClear"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82061914  # sub_82061828: addi r5,r11,3000 (heap size table for sub_82090318)
+name = "RRXX_HeapSizes"
+registers = ["r4", "r5"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8208FDE4  # sub_8208FDC0 (heap alloc): li r11,1 after taking the heap lock
+name = "RRXX_LogHeaps"
+
+[[entrypoint.midasm_hook]]
+address = 0x8208FE6C  # sub_8208FDC0 failure exit (r4 = heap, r7 = units)
+name = "RRXX_HeapAllocFailed"
+registers = ["r4", "r7"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82090988  # sub_820908B0 failure exit (r28 = heap, r30 = units)
+name = "RRXX_HeapAllocFailed2"
+registers = ["r28", "r30"]
+
+# Extra entrance tracks 63+ (MU-4, src/title_hooks.cpp). sub_820858A0 maps a cue name
+# to its entry in the fixed 63-track table; names of tracks 63-126 get an entry for
+# cue ENTRANCE_NNN in bank MUSIC_ENTRANCE.
+[[entrypoint.midasm_hook]]
+address = 0x820858A0  # std r31,-8(r1) (first instruction, leaf)
+name = "RRXX_ExtraMusicEntry"
+registers = ["r3", "r4"]
+return_on_true = true
+
+# EN-6h: per-EDIT-char titantron sets (src/title_hooks.cpp). sub_822C70D8 maps EDIT chars
+# 100-129 to EVRT/0100; keep the real id (r11) when evt_eff.pac has that set (EN-6L: char 100
+# = EDIT1 uses EVRT/0130, so RR's 0100 stays the default).
+[[entrypoint.midasm_hook]]
+address = 0x822C71D0  # li r4,100
+name = "RRXX_EditTitantron"
+registers = ["r4", "r11"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822C72EC  # li r4,100
+name = "RRXX_EditTitantron"
+registers = ["r4", "r11"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x822C7354  # li r4,100
+name = "RRXX_EditTitantron"
+registers = ["r4", "r11"]
+after_instruction = true
+
+# LETH-BLACK diagnostics (`log_moves`, src/title_hooks.cpp): motion lookups, move starts, camera modes.
+[[entrypoint.midasm_hook]]
+address = 0x820E0878  # mr r3,r4 (sub_820E07C0 found)
+name = "RRXX_LogLookupHit"
+registers = ["r9"]
+
+[[entrypoint.midasm_hook]]
+address = 0x820E0860  # li r3,0 (sub_820E07C0 not found)
+name = "RRXX_LogLookupMiss"
+registers = ["r9"]
+
+[[entrypoint.midasm_hook]]
+address = 0x821B5C10  # mflr r12 (sub_821B5C10 entry: move start)
+name = "RRXX_LogMoveStart"
+registers = ["r3"]
+
+[[entrypoint.midasm_hook]]
+address = 0x821D3BD8  # mflr r12 (sub_821D3BD8 entry: camera mode switch)
+name = "RRXX_LogCameraMode"
+registers = ["r3", "r4", "r5"]
+
+# VIC-CAM diagnostics (`log_moves`): hold camera target / eye / root bones per update.
+[[entrypoint.midasm_hook]]
+address = 0x821E48C0  # mflr r12 (sub_821E48C0 entry: camera update, r3 = camera)
+name = "RRXX_LogHoldCam"
+registers = ["r3"]
+
+# ASH-SINK diagnostics (`log_moves`): wrestler placement per frame in the spear acts.
+[[entrypoint.midasm_hook]]
+address = 0x821E7CC8  # mflr r12 (sub_821E7CC8 entry: per-frame motion apply, r3 = SARA object)
+name = "RRXX_LogSinkApply"
+registers = ["r3"]

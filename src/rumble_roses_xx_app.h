@@ -4,18 +4,18 @@
 
 #pragma once
 
+#include <rex/audio/audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
-#if REX_HAS_D3D12
-#include <rex/graphics/d3d12/graphics_system.h>
-#endif
-#if REX_HAS_VULKAN
-#include <rex/graphics/vulkan/graphics_system.h>
-#endif
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
+#include <rex/system/gpu_plugin.h>
+
+#include <rex/input/input_system.h>
+#include <rex/logging.h>
 
 REXCVAR_DECLARE(std::string, gpu_backend);
+REXCVAR_DECLARE(bool, pause_on_focus_loss);
 
 class RumbleRosesXxApp : public rex::ReXApp {
  public:
@@ -30,18 +30,23 @@ class RumbleRosesXxApp : public rex::ReXApp {
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}
   void OnPreSetup(rex::RuntimeConfig& config) override {
-#if REX_HAS_VULKAN
-    if (REXCVAR_GET(gpu_backend) == "vulkan") {
-      config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
-      return;
+    // SDK v0.10 moved Xenos GPU emulation into the runtime-loaded rexgpu-xenos
+    // plugin; pick the backend inside it from our gpu_backend cvar.
+    if (!config.graphics) {
+      config.graphics = rex::system::LoadGpuPlugin("xenos", REXCVAR_GET(gpu_backend));
+      if (!config.graphics) {
+        // Let ReXApp retry with any backend and show its fatal dialog on failure.
+        config.gpu_plugin = "xenos";
+      }
     }
-#endif
-#if REX_HAS_D3D12
-    if (REXCVAR_GET(gpu_backend) == "d3d12") {
-      config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::d3d12::D3D12GraphicsSystem);
-      return;
-    }
-#endif
+  }
+  // Alt-tab: mute audio and hide the pad from the game (no thread suspend).
+  void OnWindowFocusChanged(bool focused) override {
+    const bool block = !focused && REXCVAR_GET(pause_on_focus_loss);
+    rex::audio::g_audio_muted.store(block);
+    rex::input::g_input_blocked.store(block);
+    REXLOG_INFO("Window {}: audio {} / pad {}", focused ? "focused" : "unfocused",
+                block ? "muted" : "on", block ? "ignored" : "active");
   }
   // void OnLoadXexImage(std::string& xex_image) override {}
   // void OnPostSetup() override {}

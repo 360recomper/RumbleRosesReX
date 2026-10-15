@@ -23,4 +23,4 @@ else()
     add_executable(rumble_roses_xx ${RUMBLEROSESXX_SOURCES})
 endif()
 
-rexglue_setup_target(rumble_roses_xx)
+rexglue_setup_target(rumble_roses_xx GPU_PLUGINS xenos)
