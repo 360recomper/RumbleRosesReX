@@ -256,20 +256,30 @@ public static class ModPack
         return log;
     }
 
-    /// <summary>Writes save edits that waited for the game to create its save. Safe to call any time.</summary>
+    /// <summary>Writes save edits that waited for the game to create its save. Safe to call any time.
+    /// PendingSave is cleared only when at least one save was patched (now or earlier); otherwise it stays and the
+    /// result says why (no save found / empty / wrong size / bad checksum), so the next launcher start retries.</summary>
     public static string ApplyPendingSave(Record rec)
     {
         if (rec.PendingSave is not { } se || rec.PackPath == null) return "";
         var saves = FindSaves();
+        const string Todo = "One more step: start the game, save once in the game (any save), then quit. The launcher finishes the mod pack by itself after you quit.";
         if (saves.Count == 0)
-            return "No save yet: start the game once (to the title menu), quit, then open the launcher again. The divas' names and moves are added then.";
+        {
+            LogDetail("no savegame.txt found anywhere under " + Paths.Saves);
+            return Todo;
+        }
         var data = File.ReadAllBytes(Path.Combine(Paths.Root, rec.PackPath));
-        int n = 0;
+        int n = 0, already = 0;
+        var skipped = new List<string>();
         foreach (var p in saves)
         {
-            if (rec.Saves.Any(s => s.Path == Path.GetRelativePath(Paths.Root, p))) continue;
+            var rel = Path.GetRelativePath(Paths.Root, p);
+            if (rec.Saves.Any(s => s.Path == rel)) { already++; continue; }
             var d = File.ReadAllBytes(p);
-            if (d.Length != se.SavegameSize || ReadBE(d, 0) != d.Length || ReadBE(d, d.Length - 4) != SaveChecksum(d)) continue;
+            if (d.Length == 0) { skipped.Add($"{rel}: empty (0 bytes), the game has not written it yet"); continue; }
+            if (d.Length != se.SavegameSize) { skipped.Add($"{rel}: {d.Length} bytes, expected {se.SavegameSize}"); continue; }
+            if (ReadBE(d, 0) != d.Length || ReadBE(d, d.Length - 4) != SaveChecksum(d)) { skipped.Add($"{rel}: header or checksum is not a valid save"); continue; }
             var before = new MemoryStream();
             int pos = 0;
             foreach (var g in se.Regions)
@@ -283,18 +293,49 @@ public static class ModPack
             Directory.CreateDirectory(Path.GetDirectoryName(bf)!);
             File.WriteAllBytes(bf, before.ToArray());
             File.WriteAllBytes(p, d);
-            rec.Saves.Add(new SaveChange { Path = Path.GetRelativePath(Paths.Root, p), Before = Path.GetRelativePath(Paths.Root, bf) });
+            rec.Saves.Add(new SaveChange { Path = rel, Before = Path.GetRelativePath(Paths.Root, bf) });
             n++;
+        }
+        if (n == 0 && already == 0)
+        {
+            LogDetail("nothing usable: " + string.Join("; ", skipped));
+            return Todo;
         }
         rec.PendingSave = null;
         SaveRecord(rec);
-        return n > 0 ? $"Save updated ({n} profile(s)): divas' names, looks, themes and movesets." : "Save already up to date.";
+        if (skipped.Count > 0) LogDetail("skipped: " + string.Join("; ", skipped));
+        return n > 0 ? "Done! The mod pack's names, looks, themes and movesets are now in your save." : "Your save already has the mod pack's changes.";
     }
 
-    /// <summary>Called at launcher start: finishes save edits for packs installed before the first game run.</summary>
-    public static void FinishPending()
+    static void LogDetail(string t)
     {
-        try { foreach (var r in Installed().Where(r => r.PendingSave != null)) ApplyPendingSave(r); } catch { }
+        try { Directory.CreateDirectory(Dir); File.AppendAllText(Path.Combine(Dir, "save-log.txt"), $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} (detail) {t}{Environment.NewLine}"); } catch { }
+    }
+
+    /// <summary>Called at launcher start: finishes save edits for packs installed before the first game run.
+    /// Returns what happened (empty = nothing was pending); errors are returned and logged, never swallowed.</summary>
+    public static List<string> FinishPending()
+    {
+        var msgs = new List<string>();
+        try
+        {
+            foreach (var r in Installed().Where(r => r.PendingSave != null))
+            {
+                try { msgs.Add(ApplyPendingSave(r)); }
+                catch (Exception ex) { msgs.Add("The mod pack could not finish editing your save: " + ex.Message); }
+            }
+        }
+        catch (Exception ex) { msgs.Add("Could not check pending save edits: " + ex.Message); }
+        if (msgs.Count > 0)
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                File.AppendAllLines(Path.Combine(Dir, "save-log.txt"), msgs.Select(m => $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {m}"));
+            }
+            catch { }
+        }
+        return msgs;
     }
 
     public static List<string> Uninstall(Record rec, Action<string, double> progress)
@@ -444,16 +485,17 @@ public static class ModPack
         }
     }
 
+    /// <summary>Every savegame.txt anywhere under saves\ (any profile folder incl. 0000000000000000, any title/slot folder).</summary>
     public static List<string> FindSaves()
     {
         var res = new List<string>();
         if (!Directory.Exists(Paths.Saves)) return res;
-        foreach (var prof in Directory.GetDirectories(Paths.Saves))
+        try
         {
-            if (Path.GetFileName(prof) == "0000000000000000") continue;
-            var p = Path.Combine(prof, "4B4E07D1", "00000001", "Game Play Data", "savegame.txt");
-            if (File.Exists(p)) res.Add(p);
+            res.AddRange(Directory.EnumerateFiles(Paths.Saves, "savegame.txt", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true }));
         }
+        catch (IOException) { }
+        res.Sort(StringComparer.OrdinalIgnoreCase);
         return res;
     }
 

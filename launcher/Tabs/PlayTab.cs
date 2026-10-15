@@ -49,12 +49,24 @@ public class PlayTab : ILauncherTab
         catch { /* read-only folder: Shift still works */ }
     }
 
+    static Process? Started;
+
+    /// <summary>If a mod pack's save edit is still waiting, keeps the launcher alive (hidden) until the game closes,
+    /// then applies it and says so. No-op when nothing is pending.</summary>
+    public static void AfterGame()
+    {
+        if (Started == null || !ModPack.Installed().Any(r => r.PendingSave != null)) return;
+        try { Started.WaitForExit(); Thread.Sleep(1500); } catch { return; }
+        var msgs = ModPack.FinishPending();
+        if (msgs.Count > 0) MessageBox.Show(string.Join(Environment.NewLine + Environment.NewLine, msgs), "RRXX Launcher - mod pack save edit");
+    }
+
     public static bool Launch(Action<string>? fail = null)
     {
         if (!Paths.IsInstalled) { fail?.Invoke("Game files are not installed."); return false; }
         try
         {
-            Process.Start(new ProcessStartInfo(Paths.GameExe) { WorkingDirectory = Paths.Game, UseShellExecute = false });
+            Started = Process.Start(new ProcessStartInfo(Paths.GameExe) { WorkingDirectory = Paths.Game, UseShellExecute = false });
             return true;
         }
         catch (Exception ex) { fail?.Invoke(ex.Message); return false; }

@@ -4,7 +4,7 @@ namespace RRXXLauncher;
 
 /// <summary>
 /// Costume mods: each folder in mods\costumes\ (cos.dat, DLcos&lt;n&gt;.pac, e&lt;n&gt;\) is installed as
-/// saves\...\00000002\RRXXMOD0&lt;id&gt; under a free costume id.
+/// saves\...\00000002\RRXXMOD0&lt;id&gt; under a free costume id (port of RRXX-tools\scripts\new_costume_slot.py).
 /// </summary>
 public static class Costumes
 {

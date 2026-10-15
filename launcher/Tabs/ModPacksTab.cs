@@ -6,7 +6,7 @@ namespace RRXXLauncher.Tabs;
 /// </summary>
 public class ModPacksTab : ILauncherTab
 {
-    readonly Panel root = new() { Dock = DockStyle.Fill };
+    readonly Panel root = new() { Dock = DockStyle.Fill, AutoScroll = true };
     readonly ListBox list = new() { Width = 540, Height = 110 };
     readonly Label status = Ui.Text("");
     readonly Label current = Ui.Text("");
@@ -22,6 +22,7 @@ public class ModPacksTab : ILauncherTab
     {
         var col = Ui.Column();
         col.Controls.Add(Ui.Text("Mod packs", true));
+        col.Controls.Add(status);   // right under the title so a message is never pushed out of view
         col.Controls.Add(Ui.Text("A mod pack (.rrxxpack) holds only the changes: the launcher rebuilds its files from your own game files "
             + "(the ISO you chose in Setup), so it first checks that your ISO is the right version. Everything it changes is recorded and "
             + "can be removed again with Uninstall. Close the game before installing or removing a pack."));
@@ -36,23 +37,23 @@ public class ModPacksTab : ILauncherTab
         col.Controls.Add(row);
         col.Controls.Add(bar);
         col.Controls.Add(current);
-        col.Controls.Add(status);
         root.Controls.Add(col);
     }
 
     public void OnShown()
     {
         if (cts != null) return;
-        ModPack.FinishPending();
+        var pend = ModPack.FinishPending();
         installed = ModPack.Installed();
         list.Items.Clear();
         foreach (var r in installed)
             list.Items.Add($"{r.Title}  (version {r.PackVersion}, installed {r.Installed})"
-                + (r.PendingSave != null ? "  - save slots wait for your first game start" : ""));
+                + (r.PendingSave != null ? "  - one more step: play once and save in the game" : ""));
         if (list.Items.Count > 0) list.SelectedIndex = 0;
         installBtn.Enabled = Paths.IsInstalled;
         removeBtn.Enabled = installed.Count > 0;
         if (!Paths.IsInstalled) status.Text = "Install the game first (Setup tab: choose your ISO).";
+        else if (pend.Count > 0) status.Text = string.Join(" ", pend);
         else if (installed.Count == 0 && status.Text.Length == 0) status.Text = "No mod packs installed.";
     }
 
