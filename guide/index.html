@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RRXX Recomp Guide</title>
+<meta name="description" content="How to install the Rumble Roses XX PC recomp and its free mod pack, step by step.">
+<style>
+:root {
+  --bg: #fbf7f9; --surface: #ffffff; --surface-2: #f4edf1; --text: #1f1a1d; --muted: #6b6168;
+  --line: #e6dbe1; --accent: #c2185b; --accent-2: #7b1fa2; --accent-soft: #fde7f0; --ok: #2e7d32;
+  --warn-bg: #fff6e0; --warn-line: #f0c36d; --code-bg: #f3eef1; --shadow: 0 1px 2px rgba(60,20,40,.06), 0 8px 24px rgba(60,20,40,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141014; --surface: #1d171c; --surface-2: #261e25; --text: #f2eaf0; --muted: #b0a2ad;
+    --line: #362b34; --accent: #ff4f93; --accent-2: #c77dff; --accent-soft: #3a1828; --ok: #7bd389;
+    --warn-bg: #33270f; --warn-line: #8a6a22; --code-bg: #2a2129; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141014; --surface: #1d171c; --surface-2: #261e25; --text: #f2eaf0; --muted: #b0a2ad;
+  --line: #362b34; --accent: #ff4f93; --accent-2: #c77dff; --accent-soft: #3a1828; --ok: #7bd389;
+  --warn-bg: #33270f; --warn-line: #8a6a22; --code-bg: #2a2129; --shadow: none;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; }
+a { color: var(--accent); }
+code, kbd { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .9em; }
+code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; overflow-wrap: anywhere; }
+kbd { background: var(--surface); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 .4em; }
+.wrap { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+
+header.hero { background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: #fff; }
+header.hero .wrap { padding-top: 56px; padding-bottom: 48px; }
+.eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: .78rem; opacity: .85; margin: 0 0 8px; }
+h1 { font-size: clamp(2rem, 6vw, 3rem); line-height: 1.1; margin: 0 0 12px; letter-spacing: -.01em; }
+.lede { font-size: 1.1rem; max-width: 640px; margin: 0; opacity: .95; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+.chip { background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.3); border-radius: 999px; padding: 4px 12px; font-size: .88rem; }
+
+nav.toc { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+nav.toc .wrap { display: flex; gap: 4px; overflow-x: auto; padding-top: 8px; padding-bottom: 8px; scrollbar-width: none; }
+nav.toc a { white-space: nowrap; text-decoration: none; color: var(--muted); padding: 6px 10px; border-radius: 8px; font-size: .92rem; }
+nav.toc a:hover { background: var(--surface-2); color: var(--text); }
+.theme-btn { margin-left: auto; border: 1px solid var(--line); background: var(--surface); color: var(--text);
+  border-radius: 8px; padding: 4px 10px; font: inherit; font-size: .88rem; cursor: pointer; white-space: nowrap; }
+
+section { padding: 40px 0 8px; }
+h2 { font-size: 1.5rem; margin: 0 0 6px; letter-spacing: -.005em; }
+h2 + .sub { color: var(--muted); margin: 0 0 20px; }
+h3 { font-size: 1.08rem; margin: 0 0 6px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; box-shadow: var(--shadow); }
+.card p { margin: 0; color: var(--muted); font-size: .95rem; }
+.card .icon { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent); margin-bottom: 10px; }
+.card .icon svg { width: 18px; height: 18px; }
+
+ol.steps { list-style: none; counter-reset: s; padding: 0; margin: 0; display: grid; gap: 14px; }
+ol.steps > li { counter-increment: s; position: relative; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; padding: 16px 18px 16px 64px; box-shadow: var(--shadow); }
+ol.steps > li::before { content: counter(s); position: absolute; left: 16px; top: 16px; width: 32px; height: 32px;
+  border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: grid; place-items: center; }
+ol.steps p { margin: 4px 0 0; }
+ol.steps ul { margin: 8px 0 0; padding-left: 20px; }
+ol.steps li li { margin: 3px 0; }
+
+.tabs-demo { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 2px; }
+.tab { border: 1px solid var(--line); border-bottom: none; border-radius: 8px 8px 0 0; padding: 3px 10px; font-size: .85rem;
+  background: var(--surface-2); color: var(--muted); }
+.tab.on { background: var(--surface); color: var(--accent); font-weight: 600; border-color: var(--accent); }
+
+.note { border-left: 4px solid var(--warn-line); background: var(--warn-bg); border-radius: 10px; padding: 12px 16px; margin: 16px 0; }
+.note.ok { border-left-color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, var(--surface)); }
+.note p { margin: 0; }
+
+table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { background: var(--surface-2); font-size: .85rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+tr:last-child td { border-bottom: none; }
+.tbl { overflow-x: auto; }
+
+details { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; margin-bottom: 10px; }
+summary { cursor: pointer; font-weight: 600; }
+details p { margin: 8px 0 0; color: var(--muted); }
+
+pre.tree { background: var(--code-bg); border-radius: 12px; padding: 14px 16px; overflow-x: auto; font-size: .9rem; line-height: 1.5; margin: 0; }
+footer { color: var(--muted); font-size: .9rem; padding: 40px 0 56px; border-top: 1px solid var(--line); margin-top: 40px; }
+@media (max-width: 520px) { ol.steps > li { padding-left: 56px; } ol.steps > li::before { left: 12px; } }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Install guide</p>
+    <h1>Rumble Roses XX Recomp</h1>
+    <p class="lede">A native Windows port of the Xbox 360 game, made by static recompilation. This page takes you from the download to your first match, and then through the optional free mod pack.</p>
+    <div class="chips">
+      <span class="chip">Windows 10 / 11, 64-bit</span>
+      <span class="chip">Bring your own disc image</span>
+      <span class="chip">About 10 minutes</span>
+    </div>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Sections">
+  <div class="wrap">
+    <a href="#need">What you need</a>
+    <a href="#install">Install</a>
+    <a href="#play">Settings &amp; play</a>
+    <a href="#pack">Mod pack</a>
+    <a href="#folders">Folders</a>
+    <a href="#help">Help</a>
+    <button class="theme-btn" id="theme" type="button" aria-label="Switch light or dark">Light / dark</button>
+  </div>
+</nav>
+
+<main class="wrap">
+  <section id="need">
+    <h2>What you need</h2>
+    <p class="sub">The download holds no game files. Everything comes from your own copy.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/></svg></div>
+        <h3>Your disc image</h3>
+        <p>A <code>.iso</code> of <b>Rumble Roses XX (USA)</b>. The launcher checks the version before it copies anything.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></div>
+        <h3>A Windows PC</h3>
+        <p>Windows 10 or 11 (64-bit) and a Vulkan-capable graphics card.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 12h4M8 10v4"/><circle cx="16" cy="11" r="1"/><circle cx="18" cy="13" r="1"/><path d="M7 6h10a5 5 0 0 1 4.9 6l-.8 4a3 3 0 0 1-5.3 1.2L14 15h-4l-1.8 2.2A3 3 0 0 1 2.9 16l-.8-4A5 5 0 0 1 7 6z"/></svg></div>
+        <h3>A controller</h3>
+        <p>An Xbox-style pad is recommended. Keyboard works too.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div>
+        <h3>Disk space</h3>
+        <p>About 4 GB for the game, plus about 2.5 GB if you add the mod pack.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="sub">Four steps. The launcher does the copying and checking for you.</p>
+    <ol class="steps">
+      <li>
+        <h3>Unzip the release</h3>
+        <p>Unzip <code>RRXX-Recomp-&lt;date&gt;.zip</code> anywhere, for example <code>C:\Games\Rumble Roses XX Recomp\</code>. The folder can be moved later: every path inside is relative.</p>
+      </li>
+      <li>
+        <h3>Start the launcher</h3>
+        <p>Run <b>RRXX Launcher.exe</b>. On the first start it opens the Setup tab by itself.</p>
+        <div class="tabs-demo" aria-hidden="true"><span class="tab">Play</span><span class="tab">Settings</span><span class="tab">Mods</span><span class="tab">Mod packs</span><span class="tab">Saves</span><span class="tab on">Setup</span></div>
+      </li>
+      <li>
+        <h3>Choose your disc image</h3>
+        <p>Press <b>Choose game ISO...</b> and pick your <code>.iso</code>. The launcher checks that it is the right release, then copies the game files (about 3.6 GB) into <code>game\assets</code>.</p>
+      </li>
+      <li>
+        <h3>Add your DLC (optional)</h3>
+        <p>Press <b>Choose DLC folder...</b> and pick the folder with your Xbox 360 DLC packages. Official DLC costumes then show under <b>Others &gt; Locker Room</b>.</p>
+      </li>
+    </ol>
+  </section>
+
+  <section id="play">
+    <h2>Settings &amp; play</h2>
+    <p class="sub">Set things up once in the launcher; most of it can also be changed in game.</p>
+    <div class="tbl">
+      <table>
+        <tr><th>Setting</th><th>What it does</th></tr>
+        <tr><td>Render scale</td><td>Internal resolution. 1 = 720p, 3 = 4K-class, 6 = 8K. Higher is sharper but slower.</td></tr>
+        <tr><td>Bloom</td><td>0 = off, 1 = reduced, 2 = original glow.</td></tr>
+        <tr><td>Background blur</td><td>Off makes the arena sharp; on matches the original.</td></tr>
+        <tr><td>Anisotropic filtering</td><td>Texture sharpness at angles.</td></tr>
+        <tr><td>Unlock all / Infinite money</td><td>Optional cheats, off by default.</td></tr>
+      </table>
+    </div>
+    <div class="note ok"><p>Press <b>Save settings</b>, then <b>Play</b>. In game, <kbd>F4</kbd> (or <b>Back + Start</b> on a pad) opens quick settings: graphics backend, sharpening, mods on/off, save backup and Quit.</p></div>
+    <p>Tick <b>Skip the launcher next time</b> to go straight into the game. To get the launcher back, hold <kbd>Shift</kbd> while starting it, or double-click <code>Launcher Settings.bat</code>.</p>
+  </section>
+
+  <section id="pack">
+    <h2>The free mod pack</h2>
+    <p class="sub">One <code>.rrxxpack</code> file: 30 created wrestlers with their own looks, names, movesets, entrances and themes, 65 extra arenas with preview cards, new moves and music.</p>
+    <div class="note"><p>The pack only holds <b>changes</b>. The launcher rebuilds the modded files from <b>your own</b> game files, so the recomp's game files must already be installed from your disc image (steps above).</p></div>
+    <ol class="steps">
+      <li>
+        <h3>Close the game</h3>
+        <p>Packs are installed while the game is not running.</p>
+      </li>
+      <li>
+        <h3>Open the Mod packs tab</h3>
+        <div class="tabs-demo" aria-hidden="true"><span class="tab">Play</span><span class="tab">Settings</span><span class="tab">Mods</span><span class="tab on">Mod packs</span><span class="tab">Saves</span><span class="tab">Setup</span></div>
+        <p>Press <b>Install a pack...</b> and choose the <code>.rrxxpack</code> file. A summary shows what it will write; press <b>Yes</b>.</p>
+      </li>
+      <li>
+        <h3>Let it check and build</h3>
+        <ul>
+          <li>It checks every game file it needs against the version the pack was made for. A different disc version stops here and nothing is changed.</li>
+          <li>It checks the pack itself, so a broken download is caught before anything is written.</li>
+          <li>It rebuilds the files into <code>mods\</code> and <code>saves\</code>, sets the pack's game settings and fills the created-wrestler slots in your save.</li>
+        </ul>
+      </li>
+      <li>
+        <h3>First time only: start the game once</h3>
+        <p>On a brand-new install there is no save yet. Press <b>Play</b>, get to the title menu, quit, and open the launcher again. The wrestlers' names and movesets are added to your new save then.</p>
+      </li>
+      <li>
+        <h3>Play</h3>
+        <p>The new wrestlers are in the created-wrestler (EDIT) slots, the arenas in Exhibition's arena picker.</p>
+      </li>
+    </ol>
+    <h3 style="margin-top:22px">Removing it</h3>
+    <p>Select the pack in the Mod packs tab and press <b>Uninstall selected</b>. Its files are removed, anything it replaced comes back, its game settings are restored and its save slots get their old contents back. The rest of your save (progress, money, unlocks) stays as it is.</p>
+  </section>
+
+  <section id="folders">
+    <h2>Folders</h2>
+    <p class="sub">Back up <code>saves\</code> to keep your progress. The Saves tab does it in one click.</p>
+<pre class="tree">RRXX Launcher.exe     launcher and setup
+launcher.json         the launcher's own settings
+game\                 the game program and your copied game files
+mods\                 replacement files (yours and the mod pack's)
+modpacks\             installed mod packs: what they changed, for Uninstall
+saves\                saves, installed DLC and the shader cache
+save-backups\         backups made by the launcher or F4</pre>
+  </section>
+
+  <section id="help">
+    <h2>Help</h2>
+    <p class="sub">The usual problems and what to do.</p>
+    <details><summary>"Wrong game version" or "different version" in the launcher</summary>
+      <p>The recomp and the mod pack are built for one specific release of the game (USA). Another disc version won't work. If you installed from the right disc and still see it in the Mod packs tab, choose your ISO again in Setup to refresh the game files.</p></details>
+    <details><summary>"The pack file is damaged"</summary>
+      <p>The download was cut short or changed. Download the pack again; nothing was changed in your install.</p></details>
+    <details><summary>The created wrestlers still have default names</summary>
+      <p>Your save didn't exist yet when the pack was installed. Start the game once, quit, open the launcher again, then play.</p></details>
+    <details><summary>The game won't start</summary>
+      <p>Open the launcher and run Setup again. Logs are in <code>game\logs\</code>.</p></details>
+    <details><summary>A costume doesn't show</summary>
+      <p>Check the Mods tab. Costume folders need a <code>cos.dat</code> file. Costumes appear under Others &gt; Locker Room.</p></details>
+    <details><summary>I want to turn mods off for a moment</summary>
+      <p>Untick <b>Mods enabled</b> in the Mods tab (or in F4). The game then runs with only your original files; tick it again to come back.</p></details>
+  </section>
+
+  <footer>
+    Recomp and mod pack by YucaGuapo. Rumble Roses XX is &copy; Konami. This project is not affiliated with or endorsed by Konami or Microsoft. No game code, assets or DLC are distributed. Please support official releases.
+  </footer>
+</main>
+
+<script>
+(function () {
+  var root = document.documentElement, btn = document.getElementById('theme');
+  try { var t = localStorage.getItem('rrxx-guide-theme'); if (t) root.setAttribute('data-theme', t); } catch (e) {}
+  btn.addEventListener('click', function () {
+    var dark = root.getAttribute('data-theme') ? root.getAttribute('data-theme') === 'dark'
+      : window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var next = dark ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('rrxx-guide-theme', next); } catch (e) {}
+  });
+})();
+</script>
+</body>
+</html>

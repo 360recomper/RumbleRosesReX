@@ -39,6 +39,7 @@ resolution_scale = 2
 # Docs + licences
 # MODS.md is the internal change log (names imported content): it stays out of the exe release.
 foreach ($f in 'README.md', 'CREDITS.md') { Copy-Item (Join-Path $rel $f) $out }
+Copy-Item (Join-Path $rel 'guide\index.html') "$out\Install-Guide.html"   # illustrated install guide
 Copy-Item -Recurse (Join-Path $rel 'licenses') "$out\licenses"
 Remove-Item "$out\licenses\Tracy-dev-only.txt"  # Tracy is not in Release builds
 
