@@ -540,3 +540,11 @@ registers = ["r3"]
 address = 0x821E7CC8  # mflr r12 (sub_821E7CC8 entry: per-frame motion apply, r3 = SARA object)
 name = "RRXX_LogSinkApply"
 registers = ["r3"]
+
+# AUD-8b strike combos (src/title_hooks.cpp): sub_821B1040 returns the combo window of an act
+# from a fixed 49-entry table; imported strikes are missing, so their combos stop after one hit.
+[[entrypoint.midasm_hook]]
+address = 0x821B1070  # li r3,0 (table miss, r3 = act)
+name = "RRXX_ComboWindow"
+registers = ["r3"]
+return_on_true = true

@@ -1401,3 +1401,57 @@ void RRXX_LogHoldCam(PPCRegister& r3) {
                 GuestF32(GuestU32(ch + 148) + 56));
   }
 }
+
+// Strike combo windows for imported acts (AUD-8b).
+// sub_821B1040(act) looks the act up in a fixed 49-entry table at 0x82013FC8 ({u16 act,
+// u8 0, u8 frame}) and returns frame * 2, or 0 when the act is missing; sub_821BF140 only
+// plays the next COMBO/COMBOD hit at that frame, so a neutral strike (DAGEKI0) that is not in
+// the table never chains. Missing acts get a frame from the list below, then from
+// <mods_root>/moves/combo_windows.txt ("act frame" per line, # comments; same units as the
+// table = motion frame index).
+namespace {
+// Imported neutral strikes of the mod pack's 30 created wrestlers (2026-10-16): window =
+// hit-end event 0x5e + 3 frames (RR median).
+constexpr std::pair<uint16_t, uint8_t> kComboWindowDefaults[] = {
+    {4028, 14}, {4037, 16}, {4040, 12}, {4045, 10}, {4057, 12}, {4060, 15}, {4063, 16},
+};
+
+const std::unordered_map<uint32_t, uint32_t>& ComboWindows() {
+  static const std::unordered_map<uint32_t, uint32_t> windows = [] {
+    std::unordered_map<uint32_t, uint32_t> map;
+    for (const auto& [act, frame] : kComboWindowDefaults) {
+      map[act] = frame;
+    }
+    int count = 0;
+    const std::string root = rex::cvar::GetFlagByName("mods_root");
+    if (!root.empty()) {
+      std::ifstream file(rex::to_path(root) / "moves" / "combo_windows.txt");
+      std::string line;
+      while (file && std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+          continue;
+        }
+        unsigned act = 0, frame = 0;
+        if (std::sscanf(line.c_str(), "%u %u", &act, &frame) == 2 && act && frame && frame < 128) {
+          map[act] = frame;
+          ++count;
+        }
+      }
+    }
+    REXLOG_INFO("combo windows: {} extra acts ({} from moves/combo_windows.txt)", map.size(), count);
+    return map;
+  }();
+  return windows;
+}
+}  // namespace
+
+// sub_821B1040 table miss (li r3,0; r3 = act). True = return frame * 2 like a table hit.
+bool RRXX_ComboWindow(PPCRegister& r3) {
+  const auto& windows = ComboWindows();
+  const auto it = windows.find(r3.u32 & 0xFFFF);
+  if (it == windows.end()) {
+    return false;
+  }
+  r3.u64 = it->second * 2;
+  return true;
+}
