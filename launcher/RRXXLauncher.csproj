@@ -6,6 +6,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RRXX Launcher</AssemblyName>
+    <!-- Keep = AppVersion.Launcher; the updater never swaps in a launcher with a lower file version. -->
+    <Version>1.4.0</Version>
     <RootNamespace>RRXXLauncher</RootNamespace>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

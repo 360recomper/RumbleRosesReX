@@ -43,7 +43,8 @@ In game
 -------
   F9    DLSS 5 on/off (compare)
   F10   DLSS 5 settings panel (OptiScaler menu; click the game again to give it the keyboard back)
-  Home  ReShade menu (shows the fps counter settings)
+  Home  ReShade menu. FPS counter: off by default; to keep it on, set ShowFPS=1 in
+        dlss5\ReShade.template.ini (each launch rebuilds ReShade.ini from it)
   F4    the recomp's own settings menu, as usual. Settings changed there in a DLSS 5 run are saved to
         dlss5\RumbleRosesReX.toml (the normal launch keeps game\RumbleRosesReX.toml).
 The DLSS 5 helper is a second program (dlss5-feed-host64.exe) that starts and stops with the game.

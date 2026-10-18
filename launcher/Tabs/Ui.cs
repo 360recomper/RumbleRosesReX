@@ -9,6 +9,15 @@ static class Ui
         return b;
     }
 
+    /// <summary>A button that grows to fit its text (fixed widths clip at high DPI).</summary>
+    public static Button AutoBtn(string text, EventHandler click)
+    {
+        var b = Btn(text, click, 80);
+        b.AutoSize = true;
+        b.Padding = new Padding(6, 0, 6, 0);
+        return b;
+    }
+
     public static FlowLayoutPanel Column() => new()
     {
         Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false,
