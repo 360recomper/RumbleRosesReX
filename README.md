@@ -95,6 +95,8 @@ Build instructions: [BUILDING.md](BUILDING.md).
 
 See [CREDITS.md](CREDITS.md). Third-party licences are in [licenses](licenses).
 
+The optional DLSS 5 add-on (setup and launch scripts, no DLLs) is in [dlss5/](dlss5/README-DLSS5.txt).
+
 ## Legal
 
 Rumble Roses XX is © Konami. This project is not affiliated with or endorsed by Konami or Microsoft.
