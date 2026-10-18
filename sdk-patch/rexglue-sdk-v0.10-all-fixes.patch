@@ -186,6 +186,21 @@ index 949d185..ec19afa 100644
    X_RESULT CloseContent(const std::string_view root_name);
    X_RESULT GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                 std::vector<uint8_t>* buffer);
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index a7ab6b3..de55ece 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -39,6 +39,10 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // DLSS-UP-3: an idle dialog (e.g. an empty notification queue) does not need the
++  // UI to be repainted continuously at the monitor refresh rate.
++  virtual bool IsIdle() { return false; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
 diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
 index a570fa0..983fe09 100644
 --- a/include/rex/ui/imgui_drawer.h
@@ -218,6 +233,19 @@ index a570fa0..983fe09 100644
 +  bool gamepad_prev_active_ = false;
  
    void SetupFontTexture();
+ 
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..135d7a5 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -35,6 +35,8 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
+ 
++  bool IsIdle() override;
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
  
 diff --git a/include/rex/ui/overlay/settings_overlay.h b/include/rex/ui/overlay/settings_overlay.h
 index 5b80eac..f622e42 100644
@@ -1045,7 +1073,7 @@ index 306118e..dca5213 100644
      default:
        return SUCCEEDED(present_result) ? PaintResult::kPresented : PaintResult::kNotPresented;
 diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
-index f270f3c..288c6a1 100644
+index f270f3c..0f48dc6 100644
 --- a/src/ui/imgui_drawer.cpp
 +++ b/src/ui/imgui_drawer.cpp
 @@ -412,6 +412,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
@@ -1056,7 +1084,27 @@ index f270f3c..288c6a1 100644
    ImGui::NewFrame();
  
    assert_true(!IsDrawingDialogs());
-@@ -487,6 +488,61 @@ ImGuiIO& ImGuiDrawer::GetIO() {
+@@ -436,7 +437,18 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
+-  if (!dialogs_.empty()) {
++  // DLSS-UP-3: only dialogs with something to show need continuous repaints. The
++  // always-alive achievement toast used to keep the UI thread presenting at the
++  // monitor refresh rate (165-220 presents/s on a 239 Hz screen, uneven frame
++  // pacing); when idle, painting follows guest frames instead.
++  bool any_active = false;
++  for (ImGuiDialog* dialog : dialogs_) {
++    if (!dialog->IsIdle()) {
++      any_active = true;
++      break;
++    }
++  }
++  if (any_active) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+     if (presenter_) {
+@@ -487,6 +499,61 @@ ImGuiIO& ImGuiDrawer::GetIO() {
    return ImGui::GetIO();
  }
  
@@ -1118,6 +1166,22 @@ index f270f3c..288c6a1 100644
  void ImGuiDrawer::OnKeyDown(KeyEvent& e) {
    OnKey(e, true);
  }
+diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
+index 53b8c0b..6d440af 100644
+--- a/src/ui/overlay/achievement_toast.cpp
++++ b/src/ui/overlay/achievement_toast.cpp
+@@ -29,6 +29,11 @@ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
+   queue_.push_back({event, std::chrono::steady_clock::now()});
+ }
+ 
++bool AchievementToastDialog::IsIdle() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return queue_.empty();
++}
++
+ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+   auto now = std::chrono::steady_clock::now();
+ 
 diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
 index 4ede107..051e61f 100644
 --- a/src/ui/overlay/settings_overlay.cpp
