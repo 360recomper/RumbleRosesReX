@@ -14,8 +14,8 @@ public class Config
     public bool SkipLauncher { get; set; }
     /// <summary>Ask GitHub for a newer release when the launcher window opens (opt-out).</summary>
     public bool CheckForUpdates { get; set; } = true;
-    /// <summary>Play (and the skip-launcher start) use "Play with DLSS 5.bat" while DLSS 5 is set up.</summary>
-    public bool PlayWithDlss5 { get; set; }
+    /// <summary>Keep every wrestler's popularity at 100 so Super Star form is always unlocked (on by default, user 2026-10-24).</summary>
+    public bool AutoSuperStar { get; set; } = true;
     public Dictionary<string, CostumeState> Costumes { get; set; } = new();
 
     static readonly JsonSerializerOptions Opts = new() { WriteIndented = true };

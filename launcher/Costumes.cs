@@ -73,7 +73,7 @@ public static class Costumes
                 if (st.Id != 0 && Uninstall(st.Id)) log.Add($"{m.Name}: turned off");
                 continue;
             }
-            var used = UsedIds();
+            var used = UsedIds(st.Id != 0 ? Prefix + st.Id : null);   // its own installed folder is not a clash
             foreach (var other in cfg.Costumes.Where(kv => kv.Key != m.Name && kv.Value.Id != 0)) used.Add(other.Value.Id);
             if (st.Id == 0 || OfficialDlc.Contains(st.Id) || used.Contains(st.Id))
             {

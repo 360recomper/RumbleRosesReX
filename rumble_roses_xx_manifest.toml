@@ -58,7 +58,7 @@ name = "sub_822156E8"
 # Code pointers found in vtables (.rdata) or built via lis+addi in code that sit
 # on a clean function boundary but were not registered by the analyzer
 # (mostly prologue-less leaf/adjustor thunks merged into the previous function).
-# (Address list produced by runtime tracing of the game.)
+# Details: indirect-targets notes (research repo)
 [entrypoint.functions."8207F3C0"]  # vtable ref @ 820037FC
 name = "sub_8207F3C0"
 
@@ -208,13 +208,20 @@ address = 0x8226DE14  # bl 0x821e92c8 in sub_8226DC50
 name = "RRXX_SkipBlurQuad"
 jump_address_on_true = 0x8226DE18
 
+# R7-E13-CRASH: skip a queued Resolve (render thread) whose dest texture is null.
+[[entrypoint.midasm_hook]]
+address = 0x8216A324  # bl 0x82070f48 in sub_8216A2D0
+name = "RRXX_SkipNullResolve"
+registers = ["r6"]
+jump_address_on_true = 0x8216A328
+
 # Cheats (unlock_all / infinite_money settings). sub_8216DFA0 is the game data
 # getter; patch the data on entry, before the caller reads it.
 [[entrypoint.midasm_hook]]
 address = 0x8216DFA0  # lis r11,-32138 (first instruction)
 name = "RRXX_ApplyCheats"
 
-# Cut content / debug.
+# Cut content / debug (research notes).
 # sub_822607D8 (event scene, vtable 0x820196C0 slot 6) asks slot 11 whether an
 # event is queued (global 0x82A8A31C) and plays it; if not, slot 13
 # (sub_82260ED8) opens the leftover event debug menu (sub_8229A500 /
@@ -232,7 +239,7 @@ address = 0x82092238  # std r30,-16(r1) (first instruction)
 name = "RRXX_LogAssetPath"
 registers = ["r3"]
 
-# Created wrestlers ("Lambda"). A character model is a
+# Created wrestlers ("Lambda", research notes). A character model is a
 # composite of up to 16 parts; menus, Locker Room, character select and
 # Customize add each part through sub_82180760(composite, slot, id, kind,
 # variant). Matches reuse the model built on the select screen.
@@ -313,7 +320,7 @@ address = 0x8227A5D0  # lwz r11,1244(r31): r3 = new read buffer, r31 = CEditDLLo
 name = "RRXX_LogDlcRead"
 registers = ["r3", "r31"]
 
-# Exhibition stage select (setting
+# Exhibition stage select (research notes section 10, setting
 # exhibition_stages). The picker was built for 3 stages; these hooks replace the
 # fixed list. All are no-ops while the setting is empty.
 [[entrypoint.midasm_hook]]
@@ -465,6 +472,22 @@ registers = ["r4", "r5"]
 after_instruction = true
 
 [[entrypoint.midasm_hook]]
+address = 0x820631C0  # sub_82063188 (physical XMemAlloc): bl MmAllocatePhysicalMemoryEx args
+name = "RRXX_D3DAllocArgs"
+registers = ["r3", "r4", "r5", "r6", "r7"]
+
+[[entrypoint.midasm_hook]]
+address = 0x820631E8  # sub_82063188 failure path: spill D3D-range requests below the heap block
+name = "RRXX_D3DAllocSpill"
+registers = ["r3", "r29"]
+jump_address_on_true = 0x820631D0
+
+[[entrypoint.midasm_hook]]
+address = 0x8209055C  # sub_82090318: heap 30 setup (r23 start, r30 end); default_heap_extra_mb
+name = "RRXX_DefaultHeapMove"
+registers = ["r23", "r30"]
+
+[[entrypoint.midasm_hook]]
 address = 0x8208FDE4  # sub_8208FDC0 (heap alloc): li r11,1 after taking the heap lock
 name = "RRXX_LogHeaps"
 
@@ -480,7 +503,7 @@ registers = ["r28", "r30"]
 
 # Extra entrance tracks 63+ (MU-4, src/title_hooks.cpp). sub_820858A0 maps a cue name
 # to its entry in the fixed 63-track table; names of tracks 63-126 get an entry for
-# cue ENTRANCE_NNN in bank MUSIC_ENTRANCE.
+# cue ENTRANCE_NNN in bank MUSIC_ENTRANCE (added by RRXX-tools/audio/add_tracks.py).
 [[entrypoint.midasm_hook]]
 address = 0x820858A0  # std r31,-8(r1) (first instruction, leaf)
 name = "RRXX_ExtraMusicEntry"
@@ -548,3 +571,124 @@ address = 0x821B1070  # li r3,0 (table miss, r3 = act)
 name = "RRXX_ComboWindow"
 registers = ["r3"]
 return_on_true = true
+
+# R3-TRS: top-rope Lethal (6500-6599) vs a free standing foe (src/title_hooks.cpp); stock needs a groggy foe.
+[[entrypoint.midasm_hook]]
+address = 0x8219D7FC  # cmpwi cr6,r3,0 (after bl sub_821A7900 at 0x8219D7F8, r3 = groggy test)
+name = "RRXX_TopRopeStandingLethal"
+registers = ["r3", "r31"]
+
+# V15-KICKOUT-b: referee pin count sub_821AB8E8 (src/title_hooks.cpp). Log (log_moves) at the kick-out check, then
+# latch the pinned wrestler's button presses (pin_kickout_latch_ms) into r6 = its +608 new-press flags.
+[[entrypoint.midasm_hook]]
+address = 0x821ABA40  # loc_821ABA40: lwz r10,64(r31) (r31 referee, r29 wrestler table, r6 = referee +68 mode)
+name = "RRXX_PinRefLog"
+registers = ["r6", "r29", "r31"]
+
+[[entrypoint.midasm_hook]]
+address = 0x821ABA68  # cmplwi cr6,r6,0 after lwz r6,608(r7) (r7 pinned wrestler, r11 table entry)
+name = "RRXX_PinKickoutLatch"
+registers = ["r6", "r7", "r31"]
+
+# R3-FACECAM-HOOK: minimum in-match camera distance (+780 of the mode-0 camera, src/title_hooks.cpp).
+[[entrypoint.midasm_hook]]
+address = 0x82260188  # loc_82260188 in sub_8225F9B0: addi r3,r1,256; lfs f5,780(r31) reads the final distance
+name = "RRXX_MatchCamMinDist"
+registers = ["r31"]
+
+# R4-GOROUND-INGAME: 65xx Lethal start = 69xx two-person start (src/title_hooks.cpp); stock lays the foe down (act 0 var 3).
+[[entrypoint.midasm_hook]]
+address = 0x82198AD0  # cmplwi cr6,r11,398 (sub_82198AB0: 6500-6898 dive-Lethal branch test)
+name = "RRXX_TopRopeStandingStart"
+registers = ["r27", "r30"]
+jump_address_on_true = 0x82198D6C
+
+# R7-TOPROPE-CORNER probe (`log_moves`): attacker/foe base + yaw before/after the two-person start sub_821B4BF0.
+[[entrypoint.midasm_hook]]
+address = 0x82198DE4  # loc_82198DE4: lbz r9,384(r30) (r27 act, r30 attacker, r31 foe)
+name = "RRXX_TopRopeCornerBefore"
+registers = ["r27", "r30", "r31"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82198E04  # cmpwi cr6,r27,11068 (right after bl 0x821b4bf0)
+name = "RRXX_TopRopeCornerAfter"
+registers = ["r27", "r30", "r31"]
+
+# R5-TORRIE-DOG-b diagnostics (`log_sobj`): object-pool SOBJ requests + /SOBJ/<id> lookup result.
+[[entrypoint.midasm_hook]]
+address = 0x82157060  # mflr r12 (sub_82157060 entry, r4 = request: u16 id +0, u8 slot +2)
+name = "RRXX_LogSobjRequest"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x821570EC  # cmpwi cr6,r3,0 (after bl sub_821DE958 '/SOBJ/%04d', r3 = found, r27 = request)
+name = "RRXX_LogSobjResult"
+registers = ["r3", "r27"]
+
+# R6-PROP-HOOK2 (`log_sobj`): every archive path lookup (sub_82092538, r3 = path) for SOBJ/EVTS/EVNT + its result.
+[[entrypoint.midasm_hook]]
+address = 0x82092538  # mflr r12 (sub_82092538 entry, r3 = path, r4 = out or 0)
+name = "RRXX_LogPathLookup"
+registers = ["r3"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82092554  # addi r1,r1,128 (after bl sub_82092238, r3 = found)
+name = "RRXX_LogPathResult"
+registers = ["r3"]
+
+# R6-REMATCH-BGM / R7-MUSIC-BGM-b: results-screen Rematch replays only scene 7 after scene 8; run scene 4 first (src/title_hooks.cpp).
+[[entrypoint.midasm_hook]]
+address = 0x822BCBAC  # bl sub_820828B8 (scene 7) in the Rematch flow sub_822BCB70, r3 = music mgr
+name = "RRXX_RematchBGM"
+registers = ["r3"]
+
+# R7-MUSIC-BGM-b: log_music_scenes trace of the music scene switch (src/title_hooks.cpp).
+[[entrypoint.midasm_hook]]
+address = 0x820828B8  # mflr r12 (sub_820828B8 entry: r3 = music mgr, r4 = scene)
+name = "RRXX_LogMusicScene"
+registers = ["r3", "r4"]
+
+# R7-MUSIC-BGM-c: log_music_scenes also logs each music-player play result (src/title_hooks.cpp).
+[[entrypoint.midasm_hook]]
+address = 0x8218E5F0  # li r9,3 (sub_8218E540 after the cue lookup/play; r5 = cue idx, r3 = play result, r31 = player)
+name = "RRXX_LogMusicPlay"
+registers = ["r3", "r5", "r31"]
+
+# R7-MUSIC-BGM-d: skip cue Stop/Destroy on the match-BGM handle from a stale owner of the reused slot (src/title_hooks.cpp).
+[[entrypoint.midasm_hook]]
+address = 0x821A3508  # mflr r12 (sub_821A3508 entry = cue Stop, r3 = cue handle)
+name = "RRXX_GuardBgmCueStop"
+registers = ["r3", "r12", "r31"]
+after_instruction = true
+return_on_true = true
+
+[[entrypoint.midasm_hook]]
+address = 0x821A2AA8  # mflr r12 (sub_821A2AA8 entry = cue Destroy, r3 = cue handle)
+name = "RRXX_GuardBgmCueDestroy"
+registers = ["r3", "r12", "r31"]
+after_instruction = true
+return_on_true = true
+
+# R7-SELFTEST-ACT: dev-exe self-test, P1 plays `selftest_act` on its foe without a controller (src/title_hooks.cpp).
+[[entrypoint.midasm_hook]]
+address = 0x821C2E40  # mflr r12 (sub_821C2E40 entry: pad controller update, r3 = controller, wrestler = +20)
+name = "RRXX_SelfTestAct"
+registers = ["r3"]
+
+# POST-REL-PROPS-2P: event op 0x72 NN (attach object to participant NN), r8 = table[NN], stored next to state+76.
+[[entrypoint.midasm_hook]]
+address = 0x820D3C34  # stw r8,76(r10)
+name = "RRXX_PropParticipant"
+registers = ["r8", "r9", "r18", "r20", "r27"]
+
+# POST-REL-PROPS-2P: entrance step object asks for queue entry r4 of manager r3 (bl sub_821A0FA0): remember it.
+[[entrypoint.midasm_hook]]
+address = 0x821D0578  # bl 0x821a0fa0
+name = "RRXX_EntranceQueuePick"
+registers = ["r3", "r4"]
+
+# POST-REL-PROPS-2P: EVNT loader sub_822A9B38, r3 = id of the event starting (after bl sub_821A09D8).
+[[entrypoint.midasm_hook]]
+address = 0x822A9B4C  # mr r11,r3
+name = "RRXX_EventStart"
+registers = ["r3"]

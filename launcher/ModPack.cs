@@ -90,6 +90,17 @@ public static class ModPack
         return res;
     }
 
+    /// <summary>Record files that exist but cannot be read (id -> error). Their backups must never be deleted.</summary>
+    public static Dictionary<string, string> Unreadable()
+    {
+        var res = new Dictionary<string, string>();
+        if (!Directory.Exists(Dir)) return res;
+        foreach (var f in Directory.GetFiles(Dir, "*.json"))
+            try { JsonSerializer.Deserialize<Record>(File.ReadAllText(f), Json); }
+            catch (Exception ex) { res[Path.GetFileNameWithoutExtension(f)] = ex.Message; }
+        return res;
+    }
+
     /// <summary>DLC costume ids owned by installed packs (the Mods tab must not reuse or clean them up).</summary>
     public static HashSet<int> ReservedDlcIds() => Installed().SelectMany(r => r.DlcIds).ToHashSet();
 
@@ -117,7 +128,7 @@ public static class ModPack
             dataStart = 16 + hl;
             if (string.IsNullOrWhiteSpace(Head.Id) || Head.Id.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
                 throw new InvalidDataException("The pack has no valid id.");
-            foreach (var f in Head.Files) SafeRelative(f.Path);
+            foreach (var f in Head.Files) SafeTarget(f.Path);
         }
 
         public Stream Open(Blob b)
@@ -200,7 +211,12 @@ public static class ModPack
         var rec = new Record { Id = h.Id, Title = h.Title, PackVersion = h.PackVersion, DlcIds = h.DlcIds,
                                Installed = DateTime.Now.ToString("yyyy-MM-dd HH:mm") };
         var bk = BackupDir(h.Id);
-        if (Directory.Exists(bk)) Directory.Delete(bk, true);
+        if (Unreadable().TryGetValue(h.Id, out var perr))
+            throw new InvalidOperationException($"The install record for \"{h.Title}\" ({RecordPath(h.Id)}) is damaged ({perr}), so nothing was changed. "
+                + "Your original files are in " + bk + ". Ask for help before reinstalling.");
+        if (Directory.Exists(bk))
+            throw new InvalidOperationException($"Backups from an earlier install of \"{h.Title}\" exist in {bk} but no install record does, so nothing was changed. "
+                + "Move that folder away only after checking it holds nothing you need.");
         // the record is written before the first change, so a crash half-way can still be uninstalled
         Directory.CreateDirectory(Dir);
         SaveRecord(rec);
@@ -210,22 +226,33 @@ public static class ModPack
         foreach (var f in h.Files)
         {
             ct.ThrowIfCancellationRequested();
-            var dst = Path.Combine(Paths.Root, SafeRelative(f.Path));
+            var dst = Path.Combine(Paths.Root, SafeTarget(f.Path));
             var tmp = dst + ".rrxxpack-tmp";
             Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
             long before = done;
-            Rebuild(r, h, f, stock, tmp, n => progress("Installing " + f.Path, (double)(before + n) / total));
-            done += f.Size;
-            string? backup = null;
-            if (File.Exists(dst))
+            // a failed write (disk full, cancel, file in use) must not leave a big .rrxxpack-tmp behind
+            try
             {
-                backup = Path.Combine(bk, SafeRelative(f.Path));
-                Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-                File.Move(dst, backup, true);
+                Rebuild(r, h, f, stock, tmp, n => progress("Installing " + f.Path, (double)(before + n) / total));
+                done += f.Size;
+                string? backup = null;
+                if (File.Exists(dst))
+                {
+                    backup = Path.Combine(bk, SafeTarget(f.Path));
+                    Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+                }
+                // listed in the record BEFORE the original is moved, so a crash/cancel in between can still be undone
+                var fc = new FileChange { Path = f.Path, Backup = backup == null ? null : Path.GetRelativePath(Paths.Root, backup) };
+                rec.Files.Add(fc);
+                SaveRecord(rec);
+                if (backup != null) File.Move(dst, backup, true);
+                File.Move(tmp, dst);
             }
-            File.Move(tmp, dst);
-            rec.Files.Add(new FileChange { Path = f.Path, Backup = backup == null ? null : Path.GetRelativePath(Paths.Root, backup) });
-            if (rec.Files.Count % 20 == 0) SaveRecord(rec);
+            catch
+            {
+                try { File.Delete(tmp); } catch { }
+                throw;
+            }
         }
         SaveRecord(rec);
         log.Add($"{h.Files.Count} files installed.");
@@ -292,8 +319,9 @@ public static class ModPack
             var bf = Path.Combine(BackupDir(rec.Id), $"save-before-{rec.Saves.Count}.bin");
             Directory.CreateDirectory(Path.GetDirectoryName(bf)!);
             File.WriteAllBytes(bf, before.ToArray());
-            File.WriteAllBytes(p, d);
+            WriteAtomic(p, d);
             rec.Saves.Add(new SaveChange { Path = rel, Before = Path.GetRelativePath(Paths.Root, bf) });
+            SaveRecord(rec);
             n++;
         }
         if (n == 0 && already == 0)
@@ -317,6 +345,7 @@ public static class ModPack
     public static List<string> FinishPending()
     {
         var msgs = new List<string>();
+        if (Updater.GameRunning()) return msgs;     // never patch the save under a running game; retried at the next start
         try
         {
             foreach (var r in Installed().Where(r => r.PendingSave != null))
@@ -342,16 +371,27 @@ public static class ModPack
     {
         var log = new List<string>();
         int i = 0;
-        foreach (var f in Enumerable.Reverse(rec.Files))
+        int total = rec.Files.Count;
+        foreach (var f in Enumerable.Reverse(rec.Files.ToList()))
         {
-            progress("Removing " + f.Path, (double)i++ / Math.Max(1, rec.Files.Count));
-            var dst = Path.Combine(Paths.Root, SafeRelative(f.Path));
+            progress("Removing " + f.Path, (double)i++ / Math.Max(1, total));
+            var dst = Path.Combine(Paths.Root, SafeTarget(f.Path));
+            var tmp = dst + ".rrxxpack-tmp";
+            if (File.Exists(tmp)) File.Delete(tmp);
+            var bak = f.Backup == null ? null : Path.Combine(Paths.Root, f.Backup);
+            if (bak != null && !File.Exists(bak))
+            {
+                // backup already moved back by an interrupted run: dst is the user's original, keep it
+                rec.Files.Remove(f); SaveRecord(rec);
+                continue;
+            }
             if (File.Exists(dst)) File.Delete(dst);
-            if (f.Backup != null && File.Exists(Path.Combine(Paths.Root, f.Backup)))
-                File.Move(Path.Combine(Paths.Root, f.Backup), dst);
+            if (bak != null) File.Move(bak, dst);
             else PruneEmptyDirs(Path.GetDirectoryName(dst)!);
+            // dropped from the record right away: a second Uninstall after a failure must not touch restored files
+            rec.Files.Remove(f); SaveRecord(rec);
         }
-        log.Add($"{rec.Files.Count} files removed or restored.");
+        log.Add($"{total} files removed or restored.");
         if (rec.TomlBefore.Count > 0)
         {
             var old = Path.Combine(BackupDir(rec.Id), "toml-before.txt");
@@ -384,7 +424,7 @@ public static class ModPack
                     pos += g.Length;
                 }
                 WriteBE(d, d.Length - 4, SaveChecksum(d));
-                File.WriteAllBytes(p, d);
+                WriteAtomic(p, d);
                 n++;
             }
             // only the pack's save slots are put back; the rest of the save (progress, money) is kept
@@ -404,6 +444,14 @@ public static class ModPack
     {
         var p = Path.Combine(BackupDir(rec.Id), "save-layout.json");
         return File.Exists(p) ? JsonSerializer.Deserialize<List<Region>>(File.ReadAllText(p), Json) : null;
+    }
+
+    /// <summary>Write next to the target, then replace it: a crash never leaves a half-written save.</summary>
+    internal static void WriteAtomic(string path, byte[] data)
+    {
+        var tmp = path + ".rrxx-tmp";
+        File.WriteAllBytes(tmp, data);
+        File.Move(tmp, path, true);
     }
 
     static void SaveRecord(Record rec)
@@ -465,7 +513,7 @@ public static class ModPack
                 if (cl == 0) continue;
                 string sp;
                 if (sid == SelfSource) { outF.Flush(); sp = tmp; if (so + cl > written) throw new InvalidDataException("The pack file is damaged (self copy)."); }
-                else if (sid >= PackSource && sid - PackSource < self) sp = Path.Combine(Paths.Root, SafeRelative(h.Files[sid - PackSource].Path));
+                else if (sid >= PackSource && sid - PackSource < self) sp = Path.Combine(Paths.Root, SafeTarget(h.Files[sid - PackSource].Path));
                 else if (sid < stock.Length) sp = stock[sid];
                 else throw new InvalidDataException("The pack file is damaged (source index).");
                 if (!src.TryGetValue(sid, out var s))
@@ -486,17 +534,27 @@ public static class ModPack
     }
 
     /// <summary>Every savegame.txt anywhere under saves\ (any profile folder incl. 0000000000000000, any title/slot folder).</summary>
-    public static List<string> FindSaves()
+    /// <summary>Every savegame.txt under a profile folder (16 hex chars) in saves\. <paramref name="all"/> also returns
+    /// stray copies (backup folders etc. directly in saves\), which are only listed, never written.</summary>
+    public static List<string> FindSaves(bool all = false)
     {
         var res = new List<string>();
         if (!Directory.Exists(Paths.Saves)) return res;
         try
         {
-            res.AddRange(Directory.EnumerateFiles(Paths.Saves, "savegame.txt", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true }));
+            res.AddRange(Directory.EnumerateFiles(Paths.Saves, "savegame.txt", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true })
+                .Where(p => all || IsProfileSave(p)));
         }
         catch (IOException) { }
         res.Sort(StringComparer.OrdinalIgnoreCase);
         return res;
+    }
+
+    /// <summary>True when the file's first folder under saves\ is a profile id (16 hex chars).</summary>
+    public static bool IsProfileSave(string path)
+    {
+        var top = Path.GetRelativePath(Paths.Saves, path).Split(Path.DirectorySeparatorChar)[0];
+        return top.Length == 16 && top.All(Uri.IsHexDigit);
     }
 
     /// <summary>RRXX savegame checksum: signed sum of every byte but the last 4, stored big-endian in the last 4.</summary>
@@ -514,6 +572,16 @@ public static class ModPack
         var p = rel.Replace('/', Path.DirectorySeparatorChar);
         if (Path.IsPathRooted(p) || p.Split(Path.DirectorySeparatorChar).Any(s => s == ".." || s.Length == 0))
             throw new InvalidDataException($"Bad path in the pack: {rel}");
+        return p;
+    }
+
+    /// <summary>Where a pack file may write: only the pack's own folders, never game\, launcher.json or modpacks\.</summary>
+    static string SafeTarget(string rel)
+    {
+        var p = SafeRelative(rel);
+        var top = p.Split(Path.DirectorySeparatorChar)[0];
+        if (top is not ("saves" or "mods" or "attire") && !(top.Equals("saves", StringComparison.OrdinalIgnoreCase) || top.Equals("mods", StringComparison.OrdinalIgnoreCase) || top.Equals("attire", StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException($"A mod pack may only write to saves, mods or attire: {rel}");
         return p;
     }
 

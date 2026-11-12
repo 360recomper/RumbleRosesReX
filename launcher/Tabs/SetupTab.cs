@@ -2,9 +2,9 @@ namespace RRXXLauncher.Tabs;
 
 public class SetupTab : ILauncherTab
 {
-    readonly Panel root = new() { Dock = DockStyle.Fill };
+    readonly Panel root = new() { Dock = DockStyle.Fill, BackColor = Theme.Bg };
     readonly Label status = Ui.Text("");
-    readonly ProgressBar bar = new() { Width = 540, Height = 18, Maximum = 1000 };
+    readonly ProgressBar bar = new PinkBar { Width = Theme.S(540), Height = Theme.S(18), Maximum = 1000 };
     readonly Label current = Ui.Text("");
     readonly Button isoBtn, dlcBtn, cancelBtn;
     CancellationTokenSource? cts;
@@ -16,11 +16,11 @@ public class SetupTab : ILauncherTab
     public SetupTab()
     {
         var col = Ui.Column();
-        col.Controls.Add(Ui.Text("Game files", true));
+        col.Controls.Add(Ui.Head("Game files"));
         col.Controls.Add(Ui.Text("Choose your own Rumble Roses XX disc image (.iso). The launcher checks the version and copies the game files (about 3.6 GB) into game\\assets."));
-        isoBtn = Ui.Btn("Choose game ISO...", async (_, _) => await RunIso());
+        isoBtn = Ui.Primary(Ui.Btn("Choose game ISO...", async (_, _) => await RunIso()));
         col.Controls.Add(isoBtn);
-        col.Controls.Add(Ui.Text("DLC (optional)", true));
+        col.Controls.Add(Ui.Head("DLC (optional)"));
         col.Controls.Add(Ui.Text("Choose the folder holding your Xbox 360 DLC packages. They are unpacked into your saves folder; official DLC costumes then appear under Others > Locker Room."));
         dlcBtn = Ui.Btn("Choose DLC folder...", async (_, _) => await RunDlc());
         col.Controls.Add(dlcBtn);
@@ -30,7 +30,16 @@ public class SetupTab : ILauncherTab
         col.Controls.Add(current);
         col.Controls.Add(cancelBtn);
         col.Controls.Add(status);
+        status.ForeColor = Theme.Ink;
         root.Controls.Add(col);
+    }
+
+    /// <summary>--screenshot-all: the page as during an ISO import.</summary>
+    internal void PreviewBusy()
+    {
+        isoBtn.Enabled = dlcBtn.Enabled = false; cancelBtn.Enabled = true;
+        bar.Value = 420; current.Text = @"pac\_startup_usa.pac";
+        status.Text = "Copying game files...";
     }
 
     public void OnShown() =>
@@ -65,10 +74,11 @@ public class SetupTab : ILauncherTab
         using var dlg = new OpenFileDialog { Title = "Rumble Roses XX disc image", Filter = "Disc image (*.iso)|*.iso|All files|*.*" };
         if (dlg.ShowDialog() != DialogResult.OK) return Task.CompletedTask;
         var iso = dlg.FileName;
+        bool repair = Paths.IsInstalled;     // re-import over a working install = repair: rewrite every file
         return Run((p, ct) =>
         {
-            Setup.ImportIso(iso, p, ct);
-            return "Game files installed. You can press Play.";
+            Setup.ImportIso(iso, p, ct, repair);
+            return "Game files installed. You can press Play." + Setup.BuildShaderCacheAfterImport(p, ct);
         });
     }
 

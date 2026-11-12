@@ -6,9 +6,11 @@
 #include <rex/filesystem.h>
 #include <rex/memory.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <atomic>
 #include <deque>
 #include <mutex>
@@ -21,6 +23,8 @@
 #include <fstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -31,11 +35,46 @@ std::atomic_bool g_warned_invalid_cleanup_owner{false};
 
 constexpr uint32_t kMinimumGuestPointer = 0x10000;
 
+// Upper bound leaves room for the small field offsets the hooks add (no wrap past 4 GiB).
+constexpr uint32_t kMaximumGuestPointer = 0xFFFF0000;
+
 bool IsLikelyGuestPointer(uint32_t address) {
-  return address >= kMinimumGuestPointer;
+  return address >= kMinimumGuestPointer && address < kMaximumGuestPointer;
+}
+
+// R7-FIX-EXE #4: the data addresses below (game data, heap table, stage id, music manager) are
+// fixed to the base XEX. A different default.xex (title update) keeps the game running but turns
+// off every hook that writes guest data (cheats, heaps, stages, music); one log line says so.
+constexpr uint64_t kBaseXexFnv1a = 0xDBC7BBD7F5A11762ull;  // assets/default.xex, 5124096 bytes
+std::atomic_bool g_xex_matches{true};
+
+bool XexMatches() {
+  return g_xex_matches.load(std::memory_order_relaxed);
 }
 
 }  // namespace
+
+void RRXX_CheckXexImage(const std::filesystem::path& xex_host) {
+  std::ifstream in(xex_host, std::ios::binary);
+  if (!in) {
+    REXLOG_WARN("XEX check: cannot read {}, data hooks stay on", xex_host.string());
+    return;
+  }
+  uint64_t hash = 0xCBF29CE484222325ull;
+  char buffer[1 << 16];
+  while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+    for (std::streamsize i = 0; i < in.gcount(); ++i) {
+      hash = (hash ^ uint8_t(buffer[i])) * 0x100000001B3ull;
+    }
+  }
+  if (hash == kBaseXexFnv1a) {
+    REXLOG_INFO("XEX check: base default.xex ({:016X}), data hooks on", hash);
+    return;
+  }
+  g_xex_matches = false;
+  REXLOG_ERROR("XEX check: default.xex hash {:016X} is not the base XEX ({:016X}, title update?): "
+               "cheats, heap, stage and music hooks are off", hash, kBaseXexFnv1a);
+}
 
 extern "C" REX_FUNC(sub_823074B0) {
   uint32_t ea{};
@@ -120,6 +159,21 @@ bool RRXX_SkipBlurQuad() {
   return !REXCVAR_GET(blur);
 }
 
+// R7-E13-CRASH: the render thread replays queued Resolve packets (type 42, sub_8216A2D0 ->
+// sub_82070F48 = D3DDevice::Resolve). At the VS screen one is sometimes queued with a null
+// destination texture (r6) and the read of +0x24 crashes. Returns true to skip that Resolve.
+bool RRXX_SkipNullResolve(PPCRegister& r6) {
+  if (r6.u32 != 0) {
+    return false;
+  }
+  static std::atomic<uint32_t> skipped{0};
+  uint32_t n = ++skipped;
+  if (n <= 8 || (n & (n - 1)) == 0) {
+    REXLOG_WARN("Resolve with null dest texture skipped (#{})", n);
+  }
+  return true;
+}
+
 // Cheats. sub_8216DFA0 returns the static game data object (the save file is a
 // raw copy of it, so save offsets == object offsets). It runs on the game thread
 // right before the game reads its data, so patching here avoids races.
@@ -129,13 +183,18 @@ REXCVAR_DECLARE(bool, infinite_money);
 namespace {
 
 constexpr uint32_t kGameData = 0x8275AF78;
-constexpr uint32_t kMoney = kGameData + 0x68828;           // BE u32 RR cash
+constexpr uint32_t kMoneyBase = kGameData + 0x33A28;       // BE u32 RR cash, slot 0
+constexpr uint32_t kMoneyStride = 0x2F00;
+constexpr uint32_t kMoneySlots = 55;
+constexpr uint32_t kCurrentSlot = kGameData + 0x33798;     // BE u32 current profile slot
 constexpr uint32_t kMoneyMax = 9999999;
 constexpr uint32_t kPersonas = kGameData + 0x29565;        // u8[20], 3 = unlocked
 constexpr uint32_t kLadyXFlags = kGameData + 0x31188;      // bit0 = Lady X (personas 20/21)
 constexpr uint32_t kItemsBegin = kGameData + 0x311A0;      // 0x20-byte shop item records
 constexpr uint32_t kItemsEnd = kGameData + 0x32680;
 constexpr uint32_t kItemOwnedAll = 0x001FFFFF;             // +0x08 owned mask
+constexpr uint32_t kItemTable = kGameData + 0x31180;       // row 0 of the item records
+constexpr uint32_t kSaleRow = 58;                          // on-sale masks, one row per profile slot
 
 uint32_t LoadBE32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
@@ -156,13 +215,28 @@ void RRXX_ApplyCheats() {
   LogMovesDumpImage();
   const bool unlock = REXCVAR_GET(unlock_all);
   const bool money = REXCVAR_GET(infinite_money);
-  if (!unlock && !money) {
+  if ((!unlock && !money) || !XexMatches()) {
     return;
   }
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
 
-  if (money && LoadBE32(base + kMoney) < kMoneyMax) {
-    StoreBE32(base + kMoney, kMoneyMax);
+  if (money) {
+    // Money is per profile slot (sub_820EDEB8); top up every slot so the shop
+    // is full whichever slot is current.
+    for (uint32_t slot = 0; slot < kMoneySlots; ++slot) {
+      uint8_t* p = base + kMoneyBase + slot * kMoneyStride;
+      const uint32_t old = LoadBE32(p);
+      if (old >= kMoneyMax) {
+        continue;
+      }
+      static int money_logs = 0;
+      if (money_logs < 8) {
+        ++money_logs;
+        REXLOG_INFO("RRXX infinite_money: slot {} (current {}) money {} -> {}", slot,
+                    LoadBE32(base + kCurrentSlot), old, kMoneyMax);
+      }
+      StoreBE32(p, kMoneyMax);
+    }
   }
 
   if (unlock) {
@@ -176,16 +250,25 @@ void RRXX_ApplyCheats() {
     for (uint32_t rec = kItemsBegin; rec < kItemsEnd; rec += 0x20) {
       uint8_t* r = base + rec;
       const uint32_t owned = LoadBE32(r + 0x08);
-      if (owned != 0 && owned != kItemOwnedAll) {
-        StoreBE32(r + 0x08, kItemOwnedAll);
+      if (owned != 0 && (owned & kItemOwnedAll) != kItemOwnedAll) {
+        StoreBE32(r + 0x08, owned | kItemOwnedAll);  // keep bought swimsuit bits (items 21+)
         StoreBE32(r + 0x18, 0xFFFFFFFF);
         StoreBE32(r + 0x1C, 0xFFFFFFFF);
       }
     }
+    // Shop swimsuit page (sub_820F79D0): items 21,25..97 show "???" unless their bit is set in
+    // the on-sale mask of row 58+slot (u32[4] at +0x08). Row 113+slot = sold, left alone.
+    for (uint32_t slot = 0; slot < kMoneySlots; ++slot) {
+      uint8_t* mask = base + kItemTable + (kSaleRow + slot) * 0x20 + 0x08;
+      StoreBE32(mask, LoadBE32(mask) | 0xFFE00000);
+      StoreBE32(mask + 4, 0xFFFFFFFF);
+      StoreBE32(mask + 8, 0xFFFFFFFF);
+      StoreBE32(mask + 12, 0xFFFFFFFF);
+    }
   }
 }
 
-// Cut content / debug.
+// Cut content / debug (research notes).
 REXCVAR_DECLARE(bool, debug_event_menu);
 REXCVAR_DECLARE(bool, log_asset_paths);
 
@@ -216,7 +299,7 @@ void RRXX_LogAssetPath(PPCRegister& r3) {
   }
 }
 
-// Created wrestlers ("Lambda").
+// Created wrestlers ("Lambda"), research notes.
 REXCVAR_DECLARE(bool, log_lambda_parts);
 
 namespace {
@@ -281,10 +364,17 @@ constexpr int32_t kDlcKindHair = 4;                // bs_hair (DLC part kinds:
 constexpr int32_t kDlcKindFace = 5;                //   0 arm 1 trunk 2 waist 3 leg
 constexpr int32_t kDlcKindHead = 6;                //   4 hair 5 face 6 head)
 
+constexpr int kLambdaColours = 4;  // select-screen colour slots (loader +20)
+
 struct LambdaOverride {
   int32_t costume_id = 0;  // 0 = none
   bool keep_head = false;  // "+head": outfit only, Lambda keeps her face and hair
   bool head_only = false;  // ":head": face and hair only, Customize outfit stays
+};
+
+// One EDIT slot: an override per colour ("N=A/B/C/D"; "N=ID" = all colours).
+struct LambdaSlotOverride {
+  LambdaOverride colour[kLambdaColours];
 };
 
 std::string Trim(const std::string& s) {
@@ -293,11 +383,35 @@ std::string Trim(const std::string& s) {
   return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
 }
 
+// One colour entry: "480", "480+head" or "480:head". False if not a costume id.
+bool ParseLambdaColour(std::string item, LambdaOverride* entry) {
+  *entry = {};
+  const size_t plus = item.find('+');
+  if (plus != std::string::npos) {
+    entry->keep_head = Trim(item.substr(plus + 1)) == "head";
+    item = Trim(item.substr(0, plus));
+  }
+  const size_t colon = item.find(':');
+  if (colon != std::string::npos) {
+    entry->head_only = Trim(item.substr(colon + 1)) == "head";
+    item = Trim(item.substr(0, colon));
+  }
+  const int id = std::atoi(item.c_str());
+  if (id < 200 || id > 999) {
+    *entry = {};
+    return false;
+  }
+  entry->costume_id = id;
+  return true;
+}
+
 // Re-parsed only when the setting text changes (it is hot-reloadable).
-LambdaOverride GetLambdaOverride(uint32_t lambda_index) {
+// "3=480, 5=481+head, 1=622/630/0/632:head": a missing, 0 or bad colour entry
+// falls back to colour 1.
+LambdaOverride GetLambdaOverride(uint32_t lambda_index, uint32_t colour) {
   static std::mutex mutex;
   static std::string parsed_text;
-  static LambdaOverride table[kLambdaSlots];
+  static LambdaSlotOverride table[kLambdaSlots];
   std::lock_guard<std::mutex> lock(mutex);
   const std::string text = REXCVAR_GET(lambda_model_overrides);
   if (text != parsed_text) {
@@ -311,60 +425,80 @@ LambdaOverride GetLambdaOverride(uint32_t lambda_index) {
       if (comma == std::string::npos) {
         comma = text.size();
       }
-      std::string item = Trim(text.substr(pos, comma - pos));
+      const std::string item = Trim(text.substr(pos, comma - pos));
       pos = comma + 1;
       if (item.empty()) {
         continue;
       }
-      LambdaOverride entry;
-      const size_t plus = item.find('+');
-      if (plus != std::string::npos) {
-        entry.keep_head = Trim(item.substr(plus + 1)) == "head";
-        item = Trim(item.substr(0, plus));
-      }
-      const size_t colon = item.find(':');
-      if (colon != std::string::npos) {
-        entry.head_only = Trim(item.substr(colon + 1)) == "head";
-        item = Trim(item.substr(0, colon));
-      }
       const size_t eq = item.find('=');
-      int slot = 0;
-      int id = 0;
+      const int slot = eq == std::string::npos ? 0 : std::atoi(item.substr(0, eq).c_str());
+      LambdaSlotOverride entry;
+      int count = 0;
       if (eq != std::string::npos) {
-        slot = std::atoi(item.substr(0, eq).c_str());
-        id = std::atoi(item.substr(eq + 1).c_str());
+        const std::string ids = item.substr(eq + 1);
+        size_t start = 0;
+        while (count < kLambdaColours && start <= ids.size()) {
+          size_t slash = ids.find('/', start);
+          if (slash == std::string::npos) {
+            slash = ids.size();
+          }
+          const std::string one = Trim(ids.substr(start, slash - start));
+          start = slash + 1;
+          if (!ParseLambdaColour(one, &entry.colour[count]) && one != "0" && !one.empty()) {
+            REXLOG_WARN("lambda_model_overrides: EDIT{} colour {}: ignoring \"{}\"", slot,
+                        count + 1, one);
+          }
+          ++count;
+        }
       }
-      if (slot < 1 || slot > kLambdaSlots || id < 200 || id > 999) {
-        REXLOG_WARN("lambda_model_overrides: ignoring \"{}\" (want EDIT 1-30 = costume id 200-999)",
-                    item);
+      if (slot < 1 || slot > kLambdaSlots || entry.colour[0].costume_id == 0) {
+        REXLOG_WARN(
+            "lambda_model_overrides: ignoring \"{}\" (want EDIT 1-30 = costume id 200-999, "
+            "or EDIT=A/B/C/D per colour)",
+            item);
         continue;
       }
-      entry.costume_id = id;
+      for (int c = 1; c < kLambdaColours; ++c) {
+        if (entry.colour[c].costume_id == 0) {
+          entry.colour[c] = entry.colour[0];  // "N=ID" or a missing / 0 colour
+        }
+      }
       table[slot - 1] = entry;
-      REXLOG_INFO("lambda_model_overrides: EDIT{} -> costume {}{}", slot, id,
-                  entry.keep_head   ? " (keeps Lambda head)"
-                  : entry.head_only ? " (head only, keeps outfit)"
-                                    : "");
+      for (int c = 0; c < (count == 1 ? 1 : kLambdaColours); ++c) {
+        const LambdaOverride& ov = entry.colour[c];
+        REXLOG_INFO("lambda_model_overrides: EDIT{}{} -> costume {}{}", slot,
+                    count == 1 ? std::string() : fmt::format(" colour {}", c + 1), ov.costume_id,
+                    ov.keep_head   ? " (keeps Lambda head)"
+                    : ov.head_only ? " (head only, keeps outfit)"
+                                   : "");
+      }
     }
   }
-  return lambda_index < kLambdaSlots ? table[lambda_index] : LambdaOverride{};
+  if (lambda_index >= kLambdaSlots) {
+    return LambdaOverride{};
+  }
+  return table[lambda_index].colour[colour < kLambdaColours ? colour : 0];
 }
 
 // Which character the composite being built belongs to: the select / Locker
 // Room loader (sub_82180920 keeps itself in r21; +12 mode, +16 index) or the
 // Customize builder G (record copy at G+8600: +0 mode, +4 index).
 // Mode 0 = Lambda, 1 = built-in wrestler.
+// The loader also keeps the select-screen colour (+20, picked code % 10);
+// Customize always gets colour 0 (colour 1 attire).
 bool FindPartOwner(uint32_t composite, uint32_t caller, uint32_t r21, uint32_t* mode,
-                   uint32_t* index) {
+                   uint32_t* index, uint32_t* colour) {
   if (caller >= kEditLoaderBegin && caller < kEditLoaderEnd && IsLikelyGuestPointer(r21)) {
     *mode = GuestU32(r21 + 12);
     *index = GuestU32(r21 + 16);
+    *colour = GuestU32(r21 + 20);
     return true;
   }
   const uint32_t g = GuestU32(kCharBuilderPtr);
   if (g != 0 && composite == GuestU32(g + 4)) {
     *mode = GuestU32(g + 8600);
     *index = GuestU32(g + 8604);
+    *colour = 0;
     return true;
   }
   return false;
@@ -382,10 +516,11 @@ bool RRXX_LambdaPart(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5, PPCRegis
   }
   uint32_t mode = 0;
   uint32_t index = 0;
-  if (!FindPartOwner(r3.u32, r12.u32, r21.u32, &mode, &index) || mode != 0) {
+  uint32_t colour = 0;
+  if (!FindPartOwner(r3.u32, r12.u32, r21.u32, &mode, &index, &colour) || mode != 0) {
     return false;
   }
-  const LambdaOverride ov = GetLambdaOverride(index);
+  const LambdaOverride ov = GetLambdaOverride(index, colour);
   if (ov.costume_id == 0) {
     return false;
   }
@@ -419,7 +554,8 @@ bool RRXX_LambdaPart(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5, PPCRegis
     return false;
   }
   if (REXCVAR_GET(log_lambda_parts)) {
-    LogLambdaOnce(fmt::format("override EDIT{} slot={} -> {}", index + 1, slot,
+    LogLambdaOnce(fmt::format("override EDIT{} colour={} slot={} -> {}", index + 1, colour + 1,
+                              slot,
                               skip ? std::string("skipped")
                                    : fmt::format("id={} kind={}", r5.s32, r6.s32)));
   }
@@ -597,21 +733,27 @@ void RRXX_LogDlcRead(PPCRegister& r3, PPCRegister& r31) {
               r3.u32, GuestU32(r31.u32 + 844), std::string(path, strnlen(path, 200)));
 }
 
-// Exhibition stage select. The picker on the
+// Exhibition stage select (research notes section 10). The picker on the
 // character-select screen (object = char select + 11752, cursor at +144) is built
 // for 3 stages: sub_8214CAC8 maps the cursor to a stage (0, 1, 4), sub_8214CA80
 // maps a stage back to the cursor, the input handler sub_8214D0B0 (on the +28
 // list sub-object, cursor at +116) wraps at 2, and sub_8214CB80 creates the list
 // with a count of 3. exhibition_stages replaces that fixed list. The card strip and
 // stage names come from menu.pac MENU/CSLL, which must be built for the same list
-// (a modded menu.pac).
+// (RRXX-tools/arena/stage_menu.py).
 REXCVAR_DECLARE(std::string, exhibition_stages);
 
 namespace {
 
-const std::vector<int32_t>& ExhibitionStages() {
+// Returns a copy under a lock: F4 hot-reload can change the cvar while the picker runs.
+std::vector<int32_t> ExhibitionStages() {
+  static std::mutex mutex;
   static std::string parsed_text;
   static std::vector<int32_t> stages;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!XexMatches()) {
+    return {};
+  }
   const std::string text = REXCVAR_GET(exhibition_stages);
   if (text == parsed_text) {
     return stages;
@@ -695,7 +837,7 @@ bool RRXX_CursorFromStage(PPCRegister& r3, PPCRegister& r4) {
 // sub_8214D0B0 at 0x8214D100 (right pressed; r10 = cursor, r31 = list sub-object).
 bool RRXX_StageNext(PPCRegister& r10, PPCRegister& r31) {
   const auto& stages = ExhibitionStages();
-  if (stages.empty()) {
+  if (stages.empty() || !IsLikelyGuestPointer(r31.u32)) {
     return false;
   }
   const int32_t n = int32_t(stages.size());
@@ -707,7 +849,7 @@ bool RRXX_StageNext(PPCRegister& r10, PPCRegister& r31) {
 // sub_8214D0B0 at 0x8214D12C (left pressed).
 bool RRXX_StagePrev(PPCRegister& r10, PPCRegister& r31) {
   const auto& stages = ExhibitionStages();
-  if (stages.empty()) {
+  if (stages.empty() || !IsLikelyGuestPointer(r31.u32)) {
     return false;
   }
   const int32_t n = int32_t(stages.size());
@@ -736,6 +878,9 @@ void RRXX_StageCount(PPCRegister& r5) {
 // ids 1-11, a built-in card in the picker, or a story-mode write (strict) end it.
 namespace {
 void StageIdWritten(uint32_t site, bool strict) {
+  if (!XexMatches()) {
+    return;
+  }
   auto* id = reinterpret_cast<int8_t*>(GuestBase() + kStageIdAddress);
   const int32_t value = *id;
   if (value >= kFirstImportedStage) {
@@ -785,6 +930,8 @@ void RRXX_StageFileId(PPCRegister& r4) {
 REXCVAR_DECLARE(int32_t, mot_heap_mb);
 REXCVAR_DECLARE(int32_t, heap_block_extra_mb);
 REXCVAR_DECLARE(bool, log_heaps);
+REXCVAR_DECLARE(int32_t, default_heap_extra_mb);
+REXCVAR_DECLARE(int32_t, heap3_trim_mb);
 
 namespace {
 constexpr uint32_t kHeapSizeTable = 0x82000BB8;
@@ -796,6 +943,31 @@ constexpr uint32_t kHeapDescs = 0x8270C6F0;  // -> 24-byte {start, end, ...} per
 // Lowest physical address the block may start at: 0x0-0x1000000 is GPU writeback.
 constexpr uint32_t kLowestBlockPhys = 0x1000000;
 uint32_t g_heap_block_extra = 0;  // bytes added to the block (set by RRXX_HeapBlockAlloc)
+// R4-HEAP30-FREEZE: with default_heap_extra_mb the moved heap 30 gets its original size
+// back on top, so the block leaves out most of the old heap 30 (it stays ~1 MiB) and that
+// low memory is free for D3D overflow (RRXX_D3DAllocSpill).
+constexpr uint32_t kHeap30Reclaim = 31u << 20;
+uint32_t g_heap_block_shrink = 0;
+// R7-MEM-ENGINE: heap 3 (28 MiB) held at most ~10 MiB (log_heaps: 7.4 MiB in the 10-16 FINAL
+// session, 10.2 MiB + a refused 2 MiB request with 12 MiB in a select-sweep soak); heap3_trim_mb
+// (default 8, heap 3 = 20 MiB) takes it off heap 3 and the block, so the block starts higher and
+// the D3D spill area below it (RRXX_D3DAllocSpill) gets the memory.
+constexpr uint32_t kTrimHeap = 3;
+uint32_t g_heap_trim = 0;
+uint32_t HeapBlockSize() {
+  return kHeapBlockSize + g_heap_block_extra - g_heap_block_shrink - g_heap_trim;
+}
+uint32_t g_heap_block = 0;        // the block's address (RRXX_HeapBlockGot)
+// The game's allocator table (sub_82062F48) gives D3D (ids 128/129) and id 0 the
+// physical range 0x11300000-0x1FC00000; the moved default heap comes off its top.
+constexpr uint32_t kD3DRangeLow = 0x11300000;
+constexpr uint32_t kD3DRangeHigh = 0x1FC00000;
+constexpr uint32_t kPhysView64K = 0xA0000000;  // 64 KiB page view of physical memory
+constexpr uint32_t kMiscRangeLow = 0x10900000;  // XMemAlloc ids without their own range
+// R7-MEM-ENGINE: the misc range (10 MiB, filled top-down) peaked at ~1.2 MiB in a two-diva match;
+// D3D may spill into its bottom 6 MiB, the top 4 MiB stays for the misc ids (they have no spill).
+constexpr uint32_t kMiscSpillHigh = 0x10F00000;
+constexpr uint32_t kSpillLowPhys = 0x100000;    // keep physical 0 (= null to the GPU) unused
 }  // namespace
 
 // sub_82061828 after "lis r3,3488" (3rd sub_82065DC8 = MmAllocatePhysicalMemoryEx):
@@ -803,39 +975,45 @@ uint32_t g_heap_block_extra = 0;  // bytes added to the block (set by RRXX_HeapB
 // The allocation is top-down, so a bigger size and a lower minimum grow the block down.
 void RRXX_HeapBlockAlloc(PPCRegister& r3, PPCRegister& r4) {
   g_heap_block_extra = 0;
-  const int32_t mib = REXCVAR_GET(heap_block_extra_mb);
-  if (mib <= 0) {
+  g_heap_block_shrink = 0;
+  g_heap_trim = 0;
+  if (r3.u32 != kHeapBlockSize || !XexMatches()) {
     return;
   }
-  uint32_t extra = uint32_t(mib) << 20;
-  if (r4.u32 < kLowestBlockPhys + extra) {
+  const int32_t mib = REXCVAR_GET(heap_block_extra_mb);
+  uint32_t extra = mib > 0 ? uint32_t(mib) << 20 : 0;
+  if (extra && r4.u32 < kLowestBlockPhys + extra) {
     extra = r4.u32 > kLowestBlockPhys ? (r4.u32 - kLowestBlockPhys) & ~0xFFFFFu : 0;
     REXLOG_WARN("heap_block_extra_mb {}: limited to {} MiB", mib, extra >> 20);
   }
-  if (r3.u32 != kHeapBlockSize || !extra) {
-    return;
-  }
-  r3.u64 = r3.u32 + extra;
-  r4.u64 = r4.u32 - extra;
   g_heap_block_extra = extra;
+  g_heap_block_shrink = REXCVAR_GET(default_heap_extra_mb) > 0 ? kHeap30Reclaim : 0;
+  g_heap_trim = uint32_t(std::clamp(REXCVAR_GET(heap3_trim_mb), 0, 12)) << 20;  // heap 3 keeps >= 16 MiB
+  r3.u64 = HeapBlockSize();
+  r4.u64 = r4.u32 - extra;
 }
 
 // After "mr r31,r3": r31 = the heap block (0 = failed; the game stops before this).
 void RRXX_HeapBlockGot(PPCRegister& r31) {
-  REXLOG_INFO("heap block at {:#010x}, {:#x} bytes (+{} MiB)", r31.u32,
-              kHeapBlockSize + g_heap_block_extra, g_heap_block_extra >> 20);
+  g_heap_block = r31.u32;
+  REXLOG_INFO("heap block at {:#010x}, {:#x} bytes (+{} MiB, -{} MiB old heap 30, -{} MiB heap {})",
+              r31.u32, HeapBlockSize(), g_heap_block_extra >> 20, g_heap_block_shrink >> 20,
+              g_heap_trim >> 20, kTrimHeap);
 }
 
 // After "lis r4,3488": r4 = bytes the game clears (sub_82307FE8) = whole block.
 void RRXX_HeapBlockClear(PPCRegister& r4) {
-  r4.u64 = r4.u32 + g_heap_block_extra;
+  r4.u64 = r4.u32 + g_heap_block_extra - g_heap_block_shrink - g_heap_trim;
 }
 
 // sub_82061828 after "addi r5,r11,3000": r4 = block end (block + 0xDA00000, the game
 // subtracts 512 next), r5 = heap size table.
 void RRXX_HeapSizes(PPCRegister& r4, PPCRegister& r5) {
+  if (!XexMatches()) {
+    return;
+  }
   const uint32_t extra = g_heap_block_extra;
-  r4.u64 = r4.u32 + extra;
+  r4.u64 = r4.u32 + extra - g_heap_block_shrink - g_heap_trim;
   const int32_t mib = REXCVAR_GET(mot_heap_mb);
   uint8_t* base = GuestBase();
   uint32_t kib[kHeapCount + 1];
@@ -851,18 +1029,25 @@ void RRXX_HeapSizes(PPCRegister& r4, PPCRegister& r5) {
   // Heap 7 gets the block's extra; mot_heap_mb (if bigger) takes more from heap 30.
   uint32_t want = kib[kMotHeap] + extra / 1024;
   uint32_t taken = 0;
+  // With default_heap_extra_mb the block already leaves out kHeap30Reclaim of heap 30
+  // (it stays ~1 MiB in the block), so the guard checks what is really left there.
+  const uint32_t shrink_kib = g_heap_block_shrink / 1024;
+  const uint32_t in_block_kib = default_kib > shrink_kib ? default_kib - shrink_kib : 0;
   if (mib > 0 && uint32_t(mib) * 1024 > want) {
     taken = uint32_t(mib) * 1024 - want;
-    if (default_kib < taken + kMinDefaultHeapKiB) {
+    if (in_block_kib < taken + kMinDefaultHeapKiB) {
       REXLOG_WARN("mot_heap_mb {}: default heap would drop below 16 MiB, ignored", mib);
       taken = 0;
     }
   }
   want += taken;
-  if (want == kib[kMotHeap]) {
+  // The block left out g_heap_trim, so heap 3 must shrink by it too (else heap 30 loses it).
+  const uint32_t trim_kib = g_heap_trim / 1024;
+  if (want == kib[kMotHeap] && !trim_kib) {
     return;
   }
   kib[kMotHeap] = want;
+  kib[kTrimHeap] -= trim_kib;
   auto* memory = rex::system::kernel_state()->memory();
   const uint32_t table = memory->SystemHeapAlloc(sizeof(kib));
   if (!table) {
@@ -874,8 +1059,231 @@ void RRXX_HeapSizes(PPCRegister& r4, PPCRegister& r5) {
     StoreBE32(base + table + i * 4, kib[i]);
   }
   r5.u64 = table;
-  REXLOG_INFO("heap sizes: MOT heap {} = {} KiB, default heap = {} KiB (original {})", kMotHeap,
-              want, default_kib - taken, default_kib);
+  REXLOG_INFO("heap sizes: MOT heap {} = {} KiB, heap {} = {} KiB, default heap = {} KiB (original {})",
+              kMotHeap, want, kTrimHeap, kib[kTrimHeap], default_kib - taken, default_kib);
+}
+
+namespace {
+// Largest run of unused guest physical memory, at 64 KiB resolution.
+uint32_t PhysicalLargestFreeKiB() {
+  auto* heap = rex::system::kernel_state()->memory()->GetPhysicalHeap();
+  const uint32_t base = heap->heap_base();
+  uint32_t run = 0, best = 0;
+  for (uint32_t off = 0; off < heap->heap_size(); off += 0x10000) {
+    rex::memory::HeapAllocationInfo info{};
+    const bool used = heap->QueryRegionInfo(base + off, &info) && info.state != 0;
+    run = used ? 0 : run + 64;
+    best = std::max(best, run);
+  }
+  return best;
+}
+
+uint32_t PhysicalFreeMiB() {
+  auto* memory = rex::system::kernel_state()->memory();
+  return uint32_t((uint64_t(memory->GetPhysicalHeap()->GetUnreservedPageCount()) * 4096) >> 20);
+}
+
+// Used guest physical ranges, merged ("start-end" in MiB at 64 KiB resolution).
+std::string PhysicalMap() {
+  auto* heap = rex::system::kernel_state()->memory()->GetPhysicalHeap();
+  const uint32_t base = heap->heap_base();
+  const uint32_t size = heap->heap_size();
+  std::string out;
+  uint32_t run_start = 0;
+  bool in_run = false;
+  for (uint32_t off = 0; off < size; off += 0x10000) {
+    rex::memory::HeapAllocationInfo info{};
+    const bool used = heap->QueryRegionInfo(base + off, &info) && info.state != 0;
+    if (used && !in_run) {
+      run_start = off;
+      in_run = true;
+    } else if (!used && in_run) {
+      out += fmt::format(" {:#x}-{:#x}", run_start, off);
+      in_run = false;
+    }
+  }
+  if (in_run) {
+    out += fmt::format(" {:#x}-{:#x}", run_start, size);
+  }
+  return out;
+}
+
+// log_heaps: log the physical map whenever it changes (checked every 5 s).
+void StartPhysicalMapLogger() {
+  static std::atomic<bool> started{false};
+  if (!REXCVAR_GET(log_heaps) || started.exchange(true)) {
+    return;
+  }
+  std::thread([] {
+    std::string last;
+    for (;;) {
+      std::string map = PhysicalMap();
+      if (map != last) {
+        REXLOG_INFO("guest physical: {} MiB free, used:{}", PhysicalFreeMiB(), map);
+        last = std::move(map);
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+  }).detach();
+}
+}  // namespace
+
+namespace {
+void WatchHeapEndPad(uint32_t end) {
+  std::thread([end] {
+    const uint8_t* pad = GuestBase() + end;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      const uint32_t w0 = LoadBE32(pad), w1 = LoadBE32(pad + 4), w2 = LoadBE32(pad + 8);
+      if (w0 || w1 || w2) {
+        REXLOG_INFO("heap 30 end pad written at {:#010x}: {:#x} {:#x} {:#x} (the write the pad "
+                    "absorbs; without it this hit the page above)", end, w0, w1, w2);
+        return;
+      }
+    }
+  }).detach();
+}
+}  // namespace
+
+// R3-CRASH-HEAP30: heap 30 (default heap) is the remainder of the block, ~32 MiB, too
+// small once HD outfits load (Christy 632 waist.tex alone = 13.4 MB). The block cannot
+// grow more (24 MiB down to the GPU writeback area), so default_heap_extra_mb moves heap
+// 30 to its own physical block of original + extra, taken top-down from the D3D range.
+// sub_82090318 at loc_8209055C, after carving heaps 0-29: r23 = heap 30 start (after the
+// descriptor table at the block start), r30 = its end. The game then writes heap 30's
+// descriptor and free list from r23/r30, so only these two change. The old ~32 MiB stays
+// unused inside the block. Nothing reads the block end the carver stores (0x8270C6FC).
+// R4-HEAP30-FREEZE: the heap writes one word just past its end. Free (sub_8208FFC8,
+// merge with a free previous block) and realign (sub_8208FCC0) store the previous index
+// in word 1 of the "next" record without checking that next is the end marker, so
+// freeing the heap's last block writes end+4. In the original layout that is heap 29's
+// unused header word (heap 0 keeps 512 bytes of slack for it). The moved heap ended at
+// phys 0x1FC00000, right below a page allocated at boot (top of the D3D range): that
+// write froze the game after load. So the moved heap keeps a 64 KiB pad of its own above
+// its end, and a watcher logs once when the game writes there (proof of the cause).
+void RRXX_DefaultHeapMove(PPCRegister& r23, PPCRegister& r30) {
+  StartPhysicalMapLogger();
+  const int32_t mib = REXCVAR_GET(default_heap_extra_mb);
+  if (mib <= 0 || !XexMatches() || !g_heap_block || r23.u32 < g_heap_block || r30.u32 <= r23.u32 ||
+      r30.u32 > g_heap_block + HeapBlockSize()) {
+    return;
+  }
+  // The block left out kHeap30Reclaim of the old heap 30; the moved heap gets it back.
+  const uint32_t orig = (r30.u32 - r23.u32 + g_heap_block_shrink) & ~0xFFFFu;
+  constexpr uint32_t kHeapEndPad = 0x10000;  // owns the word the heap writes past its end
+  auto* memory = rex::system::kernel_state()->memory();
+  auto* heap = memory->LookupHeapByType(true, 64 * 1024);
+  const uint32_t protect = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
+  const uint32_t type =
+      rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit;
+  // Ask for the full extra; if the range is short, step down 16 MiB at a time.
+  for (uint32_t extra = uint32_t(mib) << 20; extra; extra = extra > (16u << 20) ? extra - (16u << 20) : 0) {
+    uint32_t address = 0;
+    if (heap->AllocRange(kPhysView64K + kD3DRangeLow, kPhysView64K + kD3DRangeHigh - 1,
+                         orig + extra + kHeapEndPad, 64 * 1024, type, protect, true,
+                         &address)) {
+      REXLOG_INFO("default heap 30 moved to {:#010x}: {} KiB + 64 KiB end pad (original {} KiB, "
+                  "+{} MiB); guest physical free now {} MiB", address, (orig + extra) / 1024,
+                  orig / 1024, extra >> 20, PhysicalFreeMiB());
+      if (extra != uint32_t(mib) << 20) {
+        REXLOG_WARN("default_heap_extra_mb {}: limited to {} MiB", mib, extra >> 20);
+      }
+      r23.u64 = address;
+      r30.u64 = address + orig + extra;
+      WatchHeapEndPad(address + orig + extra);
+      return;
+    }
+  }
+  REXLOG_ERROR("default_heap_extra_mb {}: no physical room, heap 30 stays {} KiB", mib,
+               (r30.u32 - r23.u32) / 1024);
+}
+
+// D3D overflow. sub_82063188 = the game's physical XMemAlloc: MmAllocatePhysicalMemoryEx
+// (sub_82065DC8) in the id's range from the table at 0x8270AA30; D3D ids 128/129 and id 0
+// get 0x11300000-0x1FC00000. On failure it only probes free memory (sub_82062F78) and
+// returns 0, and the game reads through the null (R4 Sable vs Christy crash, the moved
+// heap 30 sits in that range). The spill retries a failed D3D-range request below the
+// heap block (GPU writeback ends at 0x1000000), where the reclaimed old heap 30 now is.
+namespace {
+struct PhysAllocArgs {
+  uint32_t size, min, max, align, protect;
+};
+thread_local PhysAllocArgs t_phys_alloc{};
+}  // namespace
+
+// 0x820631C0, before "bl 0x82065dc8": r3 size, r4/r5 physical range, r6 alignment, r7 flags.
+void RRXX_D3DAllocArgs(PPCRegister& r3, PPCRegister& r4, PPCRegister& r5, PPCRegister& r6,
+                       PPCRegister& r7) {
+  t_phys_alloc = {r3.u32, r4.u32, r5.u32, r6.u32, r7.u32};
+}
+
+// 0x820631E8, the failure path: true = r3/r29 hold a spilled block, continue at the success
+// tail 0x820631D0 (its accounting uses r28/r30/r31, untouched).
+bool RRXX_D3DAllocSpill(PPCRegister& r3, PPCRegister& r29) {
+  const PhysAllocArgs a = t_phys_alloc;
+  if (a.min != kD3DRangeLow || !g_heap_block || !a.size) {
+    return false;
+  }
+  uint32_t page = 4096;
+  if (a.protect & 0x20000000u) {  // X_MEM_LARGE_PAGES
+    page = 64 * 1024;
+  } else if (a.protect & 0x80000000u) {  // X_MEM_16MB_PAGES
+    page = 16 * 1024 * 1024;
+  }
+  uint32_t protect = 0;
+  if (a.protect & 0x2u) {  // X_PAGE_READONLY
+    protect = rex::memory::kMemoryProtectRead;
+  } else if (a.protect & 0x4u) {  // X_PAGE_READWRITE
+    protect = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
+  }
+  if (a.protect & 0x200u) {  // X_PAGE_NOCACHE
+    protect |= rex::memory::kMemoryProtectNoCache;
+  }
+  if (a.protect & 0x400u) {  // X_PAGE_WRITECOMBINE
+    protect |= rex::memory::kMemoryProtectWriteCombine;
+  }
+  auto* heap = rex::system::kernel_state()->memory()->LookupHeapByType(true, page);
+  const uint32_t view = heap->heap_base() & 0xE0000000u;  // physical views map phys 0 here
+  const uint32_t block_phys = g_heap_block & 0x1FFFFFFFu;
+  const uint32_t align = std::max((a.align + page - 1) & ~(page - 1), page);
+  const uint32_t size = (a.size + page - 1) & ~(page - 1);
+  // Free physical memory outside the D3D range: below the heap block (the reclaimed old
+  // heap 30; pages the SDK holds there are skipped) and the gap above it up to the misc
+  // XMemAlloc range and on into that range's unused bottom (kMiscSpillHigh).
+  const uint32_t areas[2][2] = {{kSpillLowPhys, block_phys},
+                                {block_phys + HeapBlockSize(), kMiscSpillHigh}};
+  uint32_t address = 0;
+  bool ok = false;
+  for (const auto& area : areas) {
+    if (!ok && area[1] > area[0] + size) {
+      ok = heap->AllocRange(view + area[0], view + area[1] - 1, size, align,
+                            rex::memory::kMemoryAllocationReserve |
+                                rex::memory::kMemoryAllocationCommit,
+                            protect, true, &address);
+    }
+  }
+  static std::atomic<uint32_t> spills{0}, spilled_kib{0};
+  if (ok) {
+    const uint32_t n = spills.fetch_add(1) + 1;
+    const uint32_t kib = spilled_kib.fetch_add(size / 1024) + size / 1024;
+    if (n <= 20 || n % 100 == 0) {
+      REXLOG_INFO("D3D alloc spill #{}: {} KiB at {:#010x} (D3D range full); {} KiB spilled in "
+                  "all, guest physical free {} MiB", n, a.size / 1024, address, kib,
+                  PhysicalFreeMiB());
+    }
+  } else {
+    // Always logged: the game crashes right after this.
+    REXLOG_ERROR("D3D alloc of {} KiB (flags {:#x}, align {:#x}) failed in the D3D range and the "
+                 "spill areas; guest physical free {} MiB, largest free run {} KiB, {} spills "
+                 "before", a.size / 1024, a.protect, a.align, PhysicalFreeMiB(),
+                 PhysicalLargestFreeKiB(), spills.load());
+  }
+  if (!ok) {
+    return false;
+  }
+  r3.u64 = address;
+  r29.u64 = address;
+  return true;
 }
 
 namespace {
@@ -943,7 +1351,7 @@ void RRXX_LogHeaps() {
                           g_heap_min_free[h] / 1024, f[h].largest / 1024);
     }
   }
-  REXLOG_INFO("heaps free:{}", line);
+  REXLOG_INFO("heaps free:{} | guest physical free {} MiB", line, PhysicalFreeMiB());
 }
 
 namespace {
@@ -970,12 +1378,12 @@ void RRXX_HeapAllocFailed2(PPCRegister& r28, PPCRegister& r30) {
   LogHeapFailure(2, r28.u32, uint64_t(r30.u32) * 16);
 }
 
-// Extra entrance tracks (MU-4). sub_820858A0(name, &found)
+// Extra entrance tracks (MU-4, research notes). sub_820858A0(name, &found)
 // scans a fixed 63-entry table at 0x820057E8 (20 bytes: bank name, cue name, title,
 // artist, album) for the cue name built from the music number: "ENTRANCE_%03d", or
 // "MENU_%03d" with number - 46 for numbers >= 61 (61/62 = MENU_015/016). The player
 // then asks XACT for the cue by name. Numbers 63+ get an entry here pointing at cue
-// ENTRANCE_NNN in bank MUSIC_ENTRANCE; a modding tool adds those cues
+// ENTRANCE_NNN in bank MUSIC_ENTRANCE; RRXX-tools/audio/add_tracks.py adds those cues
 // (and their waves) to the sound bank. A number without a cue plays nothing.
 namespace {
 constexpr uint32_t kMusicBankEntrance = 0x82003DF4;  // "MUSIC_ENTRANCE"
@@ -988,7 +1396,7 @@ constexpr uint32_t kExtraTitleSize = 80;
 constexpr uint32_t kExtraArtistSize = 64;
 
 // Optional captions from <mods_root>/music/titles.txt: "track<TAB>title<TAB>artist" per
-// line (MU-4d; optional titles file). Missing = "Custom Track N".
+// line (MU-4d; written by RRXX-tools/audio/add_tracks.py --titles). Missing = "Custom Track N".
 struct ExtraTrackCaption {
   std::string title;
   std::string artist;
@@ -1102,7 +1510,7 @@ uint32_t ExtraTrackEntry(int track) {
 
 // sub_820858A0 entry: r3 = cue name, r4 = found flag (u32). True = return r3 as the entry.
 bool RRXX_ExtraMusicEntry(PPCRegister& r3, PPCRegister& r4) {
-  if (!IsLikelyGuestPointer(r3.u32)) {
+  if (!XexMatches() || !IsLikelyGuestPointer(r3.u32)) {
     return false;
   }
   const char* name = reinterpret_cast<const char*>(GuestBase() + r3.u32);
@@ -1111,7 +1519,7 @@ bool RRXX_ExtraMusicEntry(PPCRegister& r3, PPCRegister& r4) {
     return false;
   }
   const uint32_t entry = ExtraTrackEntry(track);
-  if (!entry) {
+  if (!entry || !IsLikelyGuestPointer(r4.u32)) {
     return false;
   }
   StoreBE32(GuestBase() + r4.u32, 1);
@@ -1269,9 +1677,13 @@ void LogMovesDumpImage() {
 void RRXX_LogLookupHit(PPCRegister& r9) { LogMoveLookup(r9.u32, 1); }
 void RRXX_LogLookupMiss(PPCRegister& r9) { LogMoveLookup(r9.u32, 0); }
 
+// R7-TOPROPE-CORNER-c: set while selftest_kind = down re-lays the foe (every frame), keeps LB/TRC lines out of the log.
+static bool g_selftest_relay = false;
+static bool g_selftest_relay_seen = false;  // a re-lay ran this session: skip the 0 <-> 20 trk lines
+
 // sub_821B5C10 entry: a wrestler object starts a move (obj +184 act, +188 var, +76 partner).
 void RRXX_LogMoveStart(PPCRegister& r3) {
-  if (!REXCVAR_GET(log_moves)) {
+  if (!REXCVAR_GET(log_moves) || g_selftest_relay) {
     return;
   }
   const uint32_t o = r3.u32;
@@ -1348,9 +1760,14 @@ void LogSinkProbe(uint32_t sara) {
 }  // namespace
 
 // ASH-SINK 2: sub_821E7CC8 entry = per-frame motion apply, r3 = motion (SARA) object, +0x20 = wrestler, +0x1C = state.
+namespace {
+void TopRopeTrack(uint32_t sara);
+}  // namespace
+
 void RRXX_LogSinkApply(PPCRegister& r3) {
   if (REXCVAR_GET(log_moves)) {
     LogSinkProbe(r3.u32);
+    TopRopeTrack(r3.u32);
   }
 }
 
@@ -1402,15 +1819,15 @@ void RRXX_LogHoldCam(PPCRegister& r3) {
   }
 }
 
-// Strike combo windows for imported acts (AUD-8b).
+// Strike combo windows for imported acts (AUD-8b, research notes "AUD-8").
 // sub_821B1040(act) looks the act up in a fixed 49-entry table at 0x82013FC8 ({u16 act,
 // u8 0, u8 frame}) and returns frame * 2, or 0 when the act is missing; sub_821BF140 only
 // plays the next COMBO/COMBOD hit at that frame, so a neutral strike (DAGEKI0) that is not in
 // the table never chains. Missing acts get a frame from the list below, then from
 // <mods_root>/moves/combo_windows.txt ("act frame" per line, # comments; same units as the
-// table = motion frame index).
+// table = motion frame index; written by RRXX-tools/moves/fullset/combo_check.py --emit).
 namespace {
-// Imported neutral strikes of the mod pack's 30 created wrestlers (2026-10-16): window =
+// Imported neutral strikes of the 30 EDIT divas (combo_check.py, 2026-10-16): window =
 // hit-end event 0x5e + 3 frames (RR median).
 constexpr std::pair<uint16_t, uint8_t> kComboWindowDefaults[] = {
     {4028, 14}, {4037, 16}, {4040, 12}, {4045, 10}, {4057, 12}, {4060, 15}, {4063, 16},
@@ -1454,4 +1871,844 @@ bool RRXX_ComboWindow(PPCRegister& r3) {
   }
   r3.u64 = it->second * 2;
   return true;
+}
+
+// R3-TRS (2026-10-25): top-rope Lethal vs a standing foe (act ids 6500-6599). sub_8219D080's 65xx branch only takes a
+// groggy foe (sub_821A7900), so in play it never fires. After that call (r3 = result, r31 = attacker, foe at +1112):
+// also accept a free standing foe in the ring (stance 3000-3499, walk 2000-2097, guard 8500-8539, dash 50/51, steps
+// 82-89). The stock 10.0 < distance < 40.0 window still follows. Logs each rejected foe act once.
+void RRXX_TopRopeStandingLethal(PPCRegister& r3, PPCRegister& r31) {
+  if (r3.u32 != 0) {
+    return;
+  }
+  const uint32_t foe = GuestU32(r31.u32 + 1112);
+  if (!foe || GuestU8(foe + 386) != 0) {
+    return;
+  }
+  const uint32_t act = GuestU32(foe + 184);
+  const bool standing = (act >= 3000 && act <= 3499) || (act >= 2000 && act <= 2097) ||
+                        (act >= 8500 && act <= 8539) || act == 50 || act == 51 || (act >= 82 && act <= 89);
+  if (standing) {
+    r3.u64 = 1;
+    return;
+  }
+  static std::mutex mutex;
+  static std::unordered_set<uint32_t> logged;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (logged.insert(act).second) {
+    REXLOG_INFO("top-rope standing Lethal: foe act {} not accepted", act);
+  }
+}
+
+// V15-KICKOUT-b (2026-11-01): referee pin count sub_821AB8E8 (r31 referee: +0x30 frames, +0x34 count 0-3, +0x40 pinner
+// slot in the wrestler table 0x82720D8C, +0x44 mode). Kick-out check at 0x821ABA4C: pinner +390 == 0, mode != 1 and the
+// pinned wrestler's (pinner +76) +608 new-press flags != 0 ON the frame the count is 3 (or count 2 + a 3/256 roll), so a
+// human mashing one button almost never hit it. Latch: any button newly pressed in the last pin_kickout_latch_ms counts.
+REXCVAR_DECLARE(int32_t, pin_kickout_latch_ms);
+
+namespace {
+
+// sub_820974A0: component lookup by tag (children via +16, then the node itself, then siblings via +12).
+uint32_t FindComponent(uint32_t node, uint32_t tag) {
+  if (!IsLikelyGuestPointer(node)) {
+    return 0;
+  }
+  for (uint32_t c = GuestU32(node + 16), n = 0; IsLikelyGuestPointer(c) && n < 64; c = GuestU32(c + 16), ++n) {
+    if (GuestU32(c + 4) == tag) {
+      return c;
+    }
+  }
+  if (GuestU32(node + 4) == tag) {
+    return node;
+  }
+  for (uint32_t c = GuestU32(node + 12), n = 0; IsLikelyGuestPointer(c) && n < 64; c = GuestU32(c + 12), ++n) {
+    if (GuestU32(c + 4) == tag) {
+      return c;
+    }
+  }
+  return 0;
+}
+
+// Pinned wrestler's pad (pinned-act path 0x82199E74: component 'COPE' at +464, +20, +44): +288 now, +284 last frame.
+uint32_t WrestlerPad(uint32_t w) {
+  const uint32_t comp = FindComponent(w + 464, 0x434F5045);
+  const uint32_t ctrl = comp ? GuestU32(comp + 20) : 0;
+  const uint32_t pad = IsLikelyGuestPointer(ctrl) ? GuestU32(ctrl + 44) : 0;
+  return IsLikelyGuestPointer(pad) ? pad : 0;
+}
+
+constexpr uint32_t kPadButtons = 0xFF000000;  // stock kick-out buttons = bits 24-26 (+608 |1/|4/|2)
+
+std::mutex g_kickout_mutex;
+std::unordered_map<uint32_t, uint64_t> g_kickout_press_ms;  // pinned wrestler -> last button press
+uint64_t g_kickout_latched = 0;                             // log: presses the latch added
+
+}  // namespace
+
+void RRXX_PinRefLog(PPCRegister& r6, PPCRegister& r29, PPCRegister& r31) {
+  if (!REXCVAR_GET(log_moves)) {
+    return;
+  }
+  const uint32_t ref = r31.u32;
+  const uint32_t pinner = GuestU32(r29.u32 + 4 * (GuestU32(ref + 64) & 7));
+  const uint32_t foe = IsLikelyGuestPointer(pinner) ? GuestU32(pinner + 76) : 0;
+  const uint32_t pad = IsLikelyGuestPointer(foe) ? WrestlerPad(foe) : 0;
+  const uint32_t count = GuestU32(ref + 52), flags = GuestU32(foe + 608), word = pad ? GuestU32(pad + 288) : 0;
+  const uint64_t key = (uint64_t(count) << 56) ^ (uint64_t(r6.u32 & 0xFF) << 48) ^ (uint64_t(GuestU8(pinner + 390)) << 40) ^
+                       (uint64_t(flags & 0xFF) << 32) ^ (word & kPadButtons) ^ (uint64_t(foe) << 8);
+  static uint64_t last = ~0ull;
+  if (key == last) {
+    return;
+  }
+  last = key;
+  REXLOG_INFO("PIN {} ref {:08X} frames {} count {} mode {} pinner {:08X} act {} +390 {} f408 {:016X} foe {:08X} act {} "
+              "+608 {} pad {:08X} latched {}",
+              LogMovesMs(), ref, GuestU32(ref + 48), count, r6.s32, pinner, GuestU32(pinner + 184), GuestU8(pinner + 390),
+              (uint64_t(GuestU32(pinner + 408)) << 32) | GuestU32(pinner + 412), foe, GuestU32(foe + 184), flags, word,
+              g_kickout_latched);
+}
+
+void RRXX_PinKickoutLatch(PPCRegister& r6, PPCRegister& r7, PPCRegister& r31) {
+  const int32_t window = REXCVAR_GET(pin_kickout_latch_ms);
+  if (window <= 0) {
+    return;
+  }
+  const uint32_t foe = r7.u32;
+  const uint32_t pad = WrestlerPad(foe);
+  const bool pressed = r6.u32 != 0 ||
+                       (pad && (GuestU32(pad + 288) & ~GuestU32(pad + 284) & kPadButtons) != 0);
+  const uint64_t now = LogMovesMs();
+  std::lock_guard<std::mutex> lock(g_kickout_mutex);
+  uint64_t& last = g_kickout_press_ms[foe];
+  if (pressed) {
+    last = now;
+  }
+  if (r6.u32 == 0 && last && now - last <= uint64_t(window)) {
+    const int32_t count = int32_t(GuestU32(r31.u32 + 52));
+    if (count >= 2) {
+      r6.u64 = 1;  // only the count 2/3 checks read it
+      if (count == 3) {
+        ++g_kickout_latched;
+      }
+    }
+  }
+}
+
+// R3-FACECAM-HOOK (2026-10-25): the in-match camera (mode 0, sub_8225F9B0, r31 = camera) puts its distance at +780 =
+// 3.1 x 16 x merged wrestler scale (+372), so an entrant scale below 1 frames chest/face in every shot. At
+// loc_82260188 (before the distance is read) clamp +780 to >= match_cam_min_dist (0 = stock). `log_moves`: each live
+// wrestler's act and scale (wrestler array 0x82720D8C, 8 slots) whenever the scale set changes, with the distance.
+REXCVAR_DECLARE(double, match_cam_min_dist);
+
+void RRXX_MatchCamMinDist(PPCRegister& r31) {
+  const uint32_t cam = r31.u32;
+  if (!IsLikelyGuestPointer(cam)) {
+    return;
+  }
+  uint8_t* p = rex::system::kernel_state()->memory()->virtual_membase() + cam + 780;
+  const uint32_t raw = LoadBE32(p);
+  float dist;
+  std::memcpy(&dist, &raw, 4);
+  const float min_dist = float(REXCVAR_GET(match_cam_min_dist));
+  const bool clamp = min_dist > 0.0f && dist < min_dist;
+  if (clamp) {
+    uint32_t v;
+    std::memcpy(&v, &min_dist, 4);
+    StoreBE32(p, v);
+  }
+  if (!REXCVAR_GET(log_moves)) {
+    return;
+  }
+  constexpr uint32_t kWrestlers = 0x82720D8C;
+  static std::mutex mutex;
+  static std::string last;
+  std::string scales;
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t w = GuestU32(kWrestlers + 4 * i);
+    if (w) {
+      scales += fmt::format(" w{} {:08X} scale {:.3f}", i, w, GuestF32(w + 372));
+    }
+  }
+  std::lock_guard<std::mutex> lock(mutex);
+  if (scales == last) {
+    return;
+  }
+  last = scales;
+  REXLOG_INFO("MATCHCAM {} dist {:.2f}{} min {:.2f}{}", LogMovesMs(), dist, clamp ? " clamped" : "", min_dist, scales);
+}
+
+// R4-GOROUND-INGAME (2026-10-26): sub_82198AB0 (Lethal act start, r3 attacker, r4 foe, r5 act) sends 6500-6898 down the
+// one-person dive path: only the attacker plays the act, the foe is put in act 0 var 3 (lying) = the foe drops at once.
+// Our 65xx Lethals are built as 69xx two-person acts (RR 6902 layout), so route 6500-6599 to the 69xx start at
+// 0x82198D6C (sub_821B4BF0 plays both tracks) and do its 69xx-only store: attacker+244 = float at 0x82007E14.
+bool RRXX_TopRopeStandingStart(PPCRegister& r27, PPCRegister& r30) {
+  const uint32_t act = r27.u32;
+  if (act < 6500 || act > 6599 || !IsLikelyGuestPointer(r30.u32)) {
+    return false;
+  }
+  uint8_t* base = GuestBase();
+  StoreBE32(base + r30.u32 + 244, LoadBE32(base + 0x82007E14u));
+  const uint32_t foe = GuestU32(r30.u32 + 1112);
+  REXLOG_INFO("top-rope standing Lethal: act {} two-person start, foe act {}", act, foe ? GuestU32(foe + 184) : 0);
+  return true;
+}
+
+// R7-TOPROPE-CORNER probe (2026-10-27, `log_moves`): top-rope Lethals (65xx/69xx) jump both wrestlers to one fixed
+// corner. Log attacker (r30) + foe (r31) base (+240), yaw (+228), act/sub/frame and bytes 384-386 at the two-person
+// start (loc_82198DE4, before sub_821B4BF0) and right after it (0x82198E04); TopRopeTrack logs the next frames.
+namespace {
+bool IsTopRopeTraceAct(uint32_t act) {
+  return (act >= 6500 && act <= 6999) || (act >= 20400 && act <= 20499) || (act >= 150 && act <= 159);
+}
+
+void LogTopRopeChar(const char* tag, const char* who, uint32_t ch) {
+  if (!IsLikelyGuestPointer(ch)) {
+    return;
+  }
+  const uint32_t m = GuestU32(ch + 84);
+  REXLOG_INFO("TRC {} {} {} {:08X} act {} sub {} frame {:.1f} base ({:.2f} {:.2f} {:.2f}) yaw {:.3f} root ({:.2f} "
+              "{:.2f} {:.2f}) b384 {} b385 {} b386 {}",
+              LogMovesMs(), tag, who, ch, GuestU32(ch + 184), GuestU32(ch + 188), GuestF32(ch + 192),
+              GuestF32(ch + 240), GuestF32(ch + 244), GuestF32(ch + 248), GuestF32(ch + 228), GuestF32(m + 48),
+              GuestF32(m + 52), GuestF32(m + 56), GuestU8(ch + 384), GuestU8(ch + 385), GuestU8(ch + 386));
+}
+
+void LogTopRopeStart(const char* tag, uint32_t act, uint32_t att, uint32_t foe) {
+  if (!REXCVAR_GET(log_moves) || act < 6500 || act > 6999) {
+    return;
+  }
+  REXLOG_INFO("TRC {} {} two-person start act {}", LogMovesMs(), tag, act);
+  LogTopRopeChar(tag, "att", att);
+  LogTopRopeChar(tag, "foe", foe);
+}
+
+// Per-frame (R7-TOPROPE-CORNER-b: from RRXX_SelfTestAct = pad update of the human wrestler; sub_821E7CC8 never runs):
+// log the wrestler + its foe on every act change (any act, to see the corner-climb path) and, while in a corner /
+// Lethal intro / top-rope act, on sub change and every 4th frame.
+void TopRopeTrackChar(uint32_t ch) {
+  if (!IsLikelyGuestPointer(ch)) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::unordered_map<uint32_t, uint64_t> last;
+  const uint32_t act = GuestU32(ch + 184);
+  const int32_t step = (act >= 20400 && act <= 20499) ? 1 : 4;  // -c: every frame of the Lethal intro (base restore)
+  const uint64_t key = (uint64_t(act) << 32) | (uint64_t(GuestU32(ch + 188) & 0xFF) << 24) |
+                       uint64_t(int32_t(GuestF32(ch + 192)) / step & 0xFFFFFF);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& k = last[ch];
+    const uint32_t prev = uint32_t(k >> 32);
+    if (k == key || (prev == act && !IsTopRopeTraceAct(act)) ||
+        ((act == 0 || act == 20) && (prev == 0 || prev == 20) && g_selftest_relay_seen)) {  // -c re-lay loop
+      return;
+    }
+    k = key;
+  }
+  LogTopRopeChar("trk", "chr", ch);
+}
+
+void TopRopeTrack(uint32_t sara) {
+  if (IsLikelyGuestPointer(sara)) {
+    TopRopeTrackChar(GuestU32(sara + 0x20));
+  }
+}
+}  // namespace
+
+// R7-TOPROPE-CORNER-c fix (2026-10-28): during the Lethal intro 20403 the attacker's base reads (0,0,0) and its root is
+// the absolute intro spot (4.98, 5.45), so the engine's corner index (+385, refreshed from the position) becomes 2 = the
+// (+x,+z) post every time. loc_82198DE4 then copies it to the foe and the 69xx starts both at that post (Ivory/Molly
+// "teleport to one fixed corner"). Base is still the real post here: recompute +385 from its quadrant first
+// (from logs: (+,+) 2, (+,-) 3, (-,+) 1, (-,-) 0; +384 stays right).
+void RRXX_TopRopeCornerBefore(PPCRegister& r27, PPCRegister& r30, PPCRegister& r31) {
+  const uint32_t act = r27.u32, att = r30.u32;
+  if (act >= 6900 && act <= 6999 && IsLikelyGuestPointer(att)) {
+    const float x = GuestF32(att + 240), z = GuestF32(att + 248);
+    if (std::fabs(x) >= 20.0f && std::fabs(z) >= 20.0f) {  // on a corner post (+-28.8)
+      const uint8_t corner = x > 0.0f ? (z > 0.0f ? 2 : 3) : (z > 0.0f ? 1 : 0);
+      uint8_t* b = GuestBase() + att + 385;
+      if (*b != corner) {
+        if (REXCVAR_GET(log_moves)) {
+          REXLOG_INFO("TRC top-rope Lethal {} corner byte {} -> {} (att base {:.2f} {:.2f})", act, *b, corner, x, z);
+        }
+        *b = corner;
+      }
+    }
+  }
+  LogTopRopeStart("before", r27.u32, r30.u32, r31.u32);
+}
+
+void RRXX_TopRopeCornerAfter(PPCRegister& r27, PPCRegister& r30, PPCRegister& r31) {
+  LogTopRopeStart("after", r27.u32, r30.u32, r31.u32);
+}
+
+// R5-TORRIE-DOG-b (2026-10-26): entrance props (SOBJ 2040/2042/2049) are not drawn. The only '/SOBJ/%04d' path is
+// sub_821DE958 <- sub_82157060 (object pool, r4 = request: u16 id +0, u8 slot +2). `log_sobj` logs each request and
+// whether the SOBJ was found (0 = missing); a stock prop (e.g. 2116) shows what a working request looks like.
+REXCVAR_DECLARE(bool, log_sobj);
+
+static uint32_t LoadBE16(const uint8_t* p) {
+  return (uint32_t(p[0]) << 8) | p[1];
+}
+
+// POST-REL-PROPS-2P: event op 0x72 NN attaches an object to participant NN (r8 = table[NN], about to go to state+76;
+// r9 = NN*4, r18 = table 0x82720D8C, r27 = event object). Solo entrance data says `72 00`, but a diva entering as 2P is
+// participant 1, so her prop stuck to 1P. A prop's participant 0 in a solo entrance now means the entrant.
+// Playing event id: captured at its EVNT load (RRXX_EventStart). Queue (sub_821A0FC0) = manager+0x100+16*i, 8 entries:
+// u16 id, +4 participant, +8 partner (-1 = solo). The manager pointer is only live while entrances are being set up, so
+// RRXX_EntranceQueuePick keeps it. Events not in the queue (not an entrance) are left alone.
+// Two entries with one id (same entrance on both sides): the second load of that id is the second entrant.
+static std::atomic<uint32_t> g_event_id{0xFFFF};
+static std::atomic<uint32_t> g_event_seq{0};
+static std::atomic<uint32_t> g_entrance_mgr{0};
+
+void RRXX_EntranceQueuePick(PPCRegister& r3, PPCRegister& r4) {
+  g_entrance_mgr.store(r3.u32);
+  if (r4.u32 == 0) {
+    g_event_id.store(0xFFFF);
+    g_event_seq.store(0);
+  }
+}
+
+void RRXX_EventStart(PPCRegister& r3) {
+  const uint32_t id = r3.u32 & 0xFFFF;
+  if (g_event_id.exchange(id) == id) {
+    g_event_seq.fetch_add(1);
+  } else {
+    g_event_seq.store(0);
+  }
+}
+
+void RRXX_PropParticipant(PPCRegister& r8, PPCRegister& r9, PPCRegister& r18, PPCRegister& r20, PPCRegister& r27) {
+  uint8_t* base = GuestBase();
+  const uint32_t nn = r9.u32 / 4;
+  const uint32_t objchr = IsLikelyGuestPointer(r27.u32) ? LoadBE32(base + r27.u32 + 32) : 1;
+  const uint32_t id = g_event_id.load();
+  const uint32_t seq = g_event_seq.load();
+  const uint32_t mgr = g_entrance_mgr.load();
+  uint32_t who = 0xFFFFFFFF, partner = 0, hits = 0;
+  if (IsLikelyGuestPointer(mgr) && id != 0xFFFF) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint32_t e = mgr + 0x100 + 16 * i;
+      if (LoadBE16(base + e) == id) {
+        if (hits <= seq) {
+          who = LoadBE32(base + e + 4);
+          partner = LoadBE32(base + e + 8);
+        }
+        ++hits;
+      }
+    }
+  }
+  uint32_t out = r8.u32;
+  if (nn == 0 && objchr == 0 && who < 8 && partner == 0xFFFFFFFF && LoadBE32(base + r20.u32 - 844) == 6) {
+    const uint32_t h = LoadBE32(base + r18.u32 + who * 4);
+    if (IsLikelyGuestPointer(h)) {
+      out = h;
+    }
+  }
+  if (REXCVAR_GET(log_sobj)) {
+    REXLOG_INFO("PROP72 nn {} in {:08X} out {:08X} obj {:08X} objchr {:08X} id {} seq {} hits {} who {} partner {:08X}",
+                nn, r8.u32, out, r27.u32, objchr, id, seq, hits, who, partner);
+  }
+  r8.u64 = out;
+}
+
+void RRXX_LogSobjRequest(PPCRegister& r4) {
+  if (!REXCVAR_GET(log_sobj) || !IsLikelyGuestPointer(r4.u32)) {
+    return;
+  }
+  uint8_t* base = GuestBase();
+  REXLOG_INFO("SOBJ request id {} slot {}", LoadBE16(base + r4.u32), base[r4.u32 + 2]);
+}
+
+void RRXX_LogSobjResult(PPCRegister& r3, PPCRegister& r27) {
+  if (!REXCVAR_GET(log_sobj) || !IsLikelyGuestPointer(r27.u32)) {
+    return;
+  }
+  uint8_t* base = GuestBase();
+  REXLOG_INFO("SOBJ lookup id {} -> {:08X}{}", LoadBE16(base + r27.u32), r3.u32, r3.u32 ? "" : " (not found)");
+}
+
+// R6-PROP-HOOK2 (2026-10-26): entrance props never pass sub_82157060. sub_82092538(path, out) is the archive lookup
+// behind every '/SOBJ/%04d', 'EVTS/%d' and '/EVNT/%d' path; log those paths and what the lookup returned.
+static thread_local char t_lookup_path[64];
+
+void RRXX_LogPathLookup(PPCRegister& r3) {
+  t_lookup_path[0] = 0;
+  if (!REXCVAR_GET(log_sobj) || !IsLikelyGuestPointer(r3.u32)) {
+    return;
+  }
+  const char* path = reinterpret_cast<const char*>(GuestBase() + r3.u32);
+  size_t n = 0;
+  while (n < sizeof(t_lookup_path) - 1 && path[n] >= 0x20 && path[n] < 0x7F) {
+    t_lookup_path[n] = path[n];
+    ++n;
+  }
+  t_lookup_path[n] = 0;
+  if (!strstr(t_lookup_path, "SOBJ") && !strstr(t_lookup_path, "EVTS") && !strstr(t_lookup_path, "EVNT")) {
+    t_lookup_path[0] = 0;
+  }
+}
+
+void RRXX_LogPathResult(PPCRegister& r3) {
+  if (!t_lookup_path[0]) {
+    return;
+  }
+  REXLOG_INFO("path lookup {} -> {:08X}{}", t_lookup_path, r3.u32, r3.u32 ? "" : " (not found)");
+  t_lookup_path[0] = 0;
+}
+
+// R6-REMATCH-BGM (2026-10-26): match BGM = MUSIC_MATCH playlist on music player mgr+108 (mgr = *0x8270C638), loaded by
+// music scene 4 and started by scene 7, both only from scene "A"; a Rematch builds only the match flow (sub_822BCFA0
+// -> match scene), so after match 1's scene 8 stop only the crowd plays. In sub_822BCFA0 after bl sub_821B5258
+// (r3 != 0 = rematch) call sub_820828B8(mgr, 4, 0) and (mgr, 7, 0). r3 is ctx.r3, so the guest context sits around it;
+// it is saved and restored whole so the following cmpwi sees the original r3.
+// R7-MUSIC-BGM (2026-10-27): the 0x82A8A6B0 flag also stays set after "New characters" (entrances play, BGM then ran
+// over them). A real Rematch loads no entrance event, so also require the current event (sub_821A09B0 =
+// *(*(*0x82A8A31C + 8) + 12), what scene 20 checks) to be null.
+// R7-FIX-EXE #5: RematchBGM and SelfTestAct rebuild the whole guest context from &r3. That is only
+// right while the codegen passes ctx.r3 by reference ("RRXX_X(ctx.r3)"); a copy would make the cast
+// point into the host stack. Trust it only when &r3 is the r3 of this thread's own context.
+static_assert(std::is_same_v<decltype(PPCContext::r3), PPCRegister>, "hooks take PPCRegister r3");
+PPCContext* ContextFromR3(PPCRegister& r3, const char* hook) {
+  auto* ts = rex::runtime::ThreadState::Get();
+  PPCContext* ctx = ts ? ts->context() : nullptr;
+  if (ctx && &ctx->r3 == &r3) {
+    return ctx;
+  }
+  static std::atomic_bool warned{false};
+  if (!warned.exchange(true)) {
+    REXLOG_ERROR("{}: r3 is not this thread's context register (codegen change?), hook skipped", hook);
+  }
+  return nullptr;
+}
+
+REXCVAR_DECLARE(bool, log_music_scenes);
+// R7-MUSIC-BGM-b (2026-10-30, self-test trace): the results-screen Rematch never reaches sub_822BCFA0 (no scene 20/14).
+// Match 1 ends with scene 8 (stop player 108, release the match banks); the Rematch flow sub_822BCB70 then calls only
+// scene 7 (play 108) -> nothing loaded, silence. Match 1 ran 4 (MATCH playlist on 108), 5 (load the banks), 7.
+// Hook at that scene-7 call (0x822BCBAC, r3 = mgr): when the last scene (mgr+276) is 8, run scene 4 first. Scene 5
+// (banks) is left out: its reload on the Rematch failed a 9 MiB heap-27 alloc and crashed (self-test r7bgmb-2).
+void RRXX_RematchBGM(PPCRegister& r3) {
+  if (!XexMatches()) {
+    return;
+  }
+  const uint32_t mgr = r3.u32;
+  if (!IsLikelyGuestPointer(mgr) || GuestU32(mgr + 276) != 8) {
+    return;
+  }
+  PPCContext* ctx_ptr = ContextFromR3(r3, "RRXX_RematchBGM");
+  if (!ctx_ptr) {
+    return;
+  }
+  PPCContext& ctx = *ctx_ptr;
+  uint8_t* base = GuestBase();
+  const PPCContext saved = ctx;
+  ctx.r3.u64 = mgr;
+  ctx.r4.u64 = 4;
+  ctx.r5.u64 = 0;
+  sub_820828B8(ctx, base);
+  ctx = saved;
+  REXLOG_INFO("rematch: match BGM playlist reloaded (music scene 4 before 7)");
+}
+
+// R7-MUSIC-BGM-b: log_music_scenes traces the music scene switch sub_820828B8(mgr, scene, 0) at its entry
+// (scene, the last scene at mgr+276, caller = lr) to find what the results-screen Rematch runs.
+void RRXX_LogMusicScene(PPCRegister& r3, PPCRegister& r4) {
+  if (!REXCVAR_GET(log_music_scenes) || !XexMatches()) {
+    return;
+  }
+  auto* ts = rex::runtime::ThreadState::Get();
+  PPCContext* ctx = ts ? ts->context() : nullptr;
+  const uint32_t lr = (ctx && &ctx->r3 == &r3) ? static_cast<uint32_t>(ctx->lr) : 0;
+  const uint32_t mgr = r3.u32;
+  const uint32_t last = IsLikelyGuestPointer(mgr) ? GuestU32(mgr + 276) : 0xFFFFFFFF;
+  const uint32_t flag = GuestU32(0x82A8A6B0);
+  // BGM player mgr+108, state +28 (sub_8218E438; 3 = playing, what scene 7 checks).
+  const uint32_t bgm = IsLikelyGuestPointer(mgr) ? GuestU32(mgr + 108) : 0;
+  const int32_t bgm_state = IsLikelyGuestPointer(bgm) ? static_cast<int32_t>(GuestU32(bgm + 28)) : -1;
+  REXLOG_INFO("music scene {} (last {}) from {:08X} mgr {:08X} rematch flag {:08X} bgm state {}", r4.s32,
+              static_cast<int32_t>(last), lr, mgr, flag, bgm_state);
+}
+
+// R7-MUSIC-BGM-c: log_music_scenes also logs every music-player play (sub_8218E540 at loc_8218E5F0, r31 = player):
+// state 3 is set there even when the cue lookup failed (r5 = 0xFFFF, handle +4 stays 0) = "playing" but silent.
+void RRXX_LogMusicPlay(PPCRegister& r3, PPCRegister& r5, PPCRegister& r31) {
+  if (!REXCVAR_GET(log_music_scenes) || !XexMatches() || !IsLikelyGuestPointer(r31.u32)) {
+    return;
+  }
+  const uint32_t p = r31.u32;
+  const uint32_t list = GuestU32(p + 12);
+  const uint32_t idx = GuestU32(p + 20);
+  const uint32_t entry = list + idx * 20;
+  auto str = [](uint32_t a) -> std::string {
+    if (!IsLikelyGuestPointer(a)) return "?";
+    const char* c = reinterpret_cast<const char*>(GuestBase() + a);
+    return std::string(c, strnlen(c, 40));
+  };
+  const bool ok = IsLikelyGuestPointer(list);
+  REXLOG_INFO("music play: player {:08X} entry {}/{} {}:{} cue idx {:04X} r3 {:08X} handle {:08X} mode {} state {}",
+              p, idx, GuestU32(p + 16), ok ? str(GuestU32(entry)) : "?", ok ? str(GuestU32(entry + 4)) : "?",
+              r5.u32 & 0xFFFF, r3.u32, GuestU32(p + 4), GuestU32(p + 32), static_cast<int32_t>(GuestU32(p + 28)));
+}
+
+// R7-MUSIC-BGM-d (2026-11-01): cue handles are slots in the bank's cue-instance array (stride 0x78) and get reused.
+// In r7bgmd-1 every Rematch whose BGM got slot A5C7E3B4 (an earlier entrance cue's slot) was stopped ~22 s in by
+// someone else holding that slot, with no music scene in between = the silent rematch. Guard at the entry of cue Stop
+// (sub_821A3508) and cue Destroy (sub_821A2AA8), r12 = caller: a call on the current match-BGM handle (player
+// *(*0x8270C638 + 108), handle +4) is skipped unless it comes from a music-player function (0x8218E2C8-0x8218E7D0)
+// working on that BGM player (r31 at entry = the caller's player). The BGM player's own stop/advance still runs.
+static bool GuardBgmCue(const char* what, uint32_t handle, uint32_t caller, uint32_t r31) {
+  if (!XexMatches() || handle == 0) {
+    return false;
+  }
+  const uint32_t mgr = GuestU32(0x8270C638);
+  if (!IsLikelyGuestPointer(mgr)) {
+    return false;
+  }
+  const uint32_t bgm = GuestU32(mgr + 108);
+  if (!IsLikelyGuestPointer(bgm) || GuestU32(bgm + 4) != handle) {
+    return false;
+  }
+  const bool own = caller >= 0x8218E2C8 && caller < 0x8218E7D0 && r31 == bgm;
+  if (own) {
+    if (REXCVAR_GET(log_music_scenes)) {
+      REXLOG_INFO("music cue {} on BGM handle {:08X} from {:08X} (BGM player, allowed)", what, handle, caller);
+    }
+    return false;
+  }
+  REXLOG_INFO("music cue {} on BGM handle {:08X} from {:08X} r31 {:08X} skipped (stale owner)", what, handle, caller,
+              r31);
+  return true;
+}
+
+bool RRXX_GuardBgmCueStop(PPCRegister& r3, PPCRegister& r12, PPCRegister& r31) {
+  if (!GuardBgmCue("stop", r3.u32, r12.u32, r31.u32)) {
+    return false;
+  }
+  r3.u64 = 0;
+  return true;
+}
+
+bool RRXX_GuardBgmCueDestroy(PPCRegister& r3, PPCRegister& r12, PPCRegister& r31) {
+  if (!GuardBgmCue("destroy", r3.u32, r12.u32, r31.u32)) {
+    return false;
+  }
+  r3.u64 = 0;
+  return true;
+}
+
+// R7-SELFTEST-ACT (2026-10-27): play any act in game without a controller (dev exe, selftest_act = 0 = off).
+// sub_821C2E40 = pad controller update (r3 = controller, wrestler = +20; it calls the Lethal trigger sub_8219D080 with
+// that wrestler, whose foe is +1112). P1 = the first wrestler seen there after a 3 s gap (= new match); its first live
+// frame (+408 top bit, the same gate the update uses) starts the clock. Starts go through the engine's own paths:
+// lethal = sub_82198AB0(att, foe, act) (what the Lethal task calls after the 20403 intro: 65xx-68xx dive, 69xx / corner /
+// ropes two-person), two = sub_821B4BF0(att, foe, act) (grapple start), solo = sub_820D50A8(att, act, 0, 0, 0.0).
+// A due start waits until neither wrestler is linked to a partner (+76). Each start logs "selftest: start ...".
+REXCVAR_DECLARE(int32_t, selftest_act);
+REXCVAR_DECLARE(double, selftest_delay_s);
+REXCVAR_DECLARE(double, selftest_repeat_s);
+REXCVAR_DECLARE(bool, selftest_foe_down);
+REXCVAR_DECLARE(std::string, selftest_kind);
+REXCVAR_DECLARE(double, selftest_down_near);
+REXCVAR_DECLARE(int32_t, selftest_down_act);
+REXCVAR_DECLARE(int32_t, selftest_corner);
+REXCVAR_DECLARE(double, selftest_run_gap);
+// infinite_special (same hook, human wrestlers only): finishing gauge kept full. fill code before loc_821B29E8: +756 =
+// partial (stock at 100), +748 = stocks (each Killer/Lethal/H-move does -1, Lethal trigger needs > 0), +760 = shown bars (cap 4).
+REXCVAR_DECLARE(bool, infinite_special);
+// R7-BETH-GS-HOLD-f: per-frame pair log. char+84+4i = model matrix of joint i of the 33-name list at 0x82495138
+// (root, koshi, mune, ..), +48 = world translation. "PAIRN" names the joints once; "PAIR" = one line per wrestler.
+REXCVAR_DECLARE(int32_t, log_pair_act);
+namespace {
+void LogPairChar(const char* who, uint32_t ch, uint64_t frame_no) {
+  if (!IsLikelyGuestPointer(ch)) {
+    return;
+  }
+  std::string j;
+  for (uint32_t i = 0; i < 33; ++i) {
+    const uint32_t m = GuestU32(ch + 84 + 4 * i);
+    if (IsLikelyGuestPointer(m)) {
+      j += fmt::format(" {:.2f},{:.2f},{:.2f}", GuestF32(m + 48), GuestF32(m + 52), GuestF32(m + 56));
+    } else {
+      j += " -";
+    }
+  }
+  REXLOG_INFO("PAIR {} {} {:08X} act {} sub {} f {:.1f} base {:.2f},{:.2f},{:.2f} yaw {:.3f} J{}", frame_no, who, ch,
+              GuestU32(ch + 184), GuestU32(ch + 188), GuestF32(ch + 192), GuestF32(ch + 240), GuestF32(ch + 244),
+              GuestF32(ch + 248), GuestF32(ch + 228), j);
+}
+
+void LogPair(uint32_t att) {
+  const int32_t lo = REXCVAR_GET(log_pair_act);
+  if (lo <= 0 || !IsLikelyGuestPointer(att)) {
+    return;
+  }
+  const uint32_t foe = GuestU32(att + 1112);
+  auto in = [lo](uint32_t ch) {
+    if (!IsLikelyGuestPointer(ch)) {
+      return false;
+    }
+    const uint32_t a = GuestU32(ch + 184);
+    return a >= uint32_t(lo) && a < uint32_t(lo) + 1000;
+  };
+  if (!in(att) && !in(foe)) {
+    return;
+  }
+  static bool named = false;
+  if (!named) {
+    named = true;
+    std::string n;
+    for (uint32_t i = 0; i < 33; ++i) {
+      const uint32_t s = GuestU32(0x82495138 + 4 * i);
+      n += ' ';
+      n += IsLikelyGuestPointer(s) ? std::string(reinterpret_cast<const char*>(GuestBase() + s)) : std::string("?");
+    }
+    REXLOG_INFO("PAIRN{}", n);
+  }
+  static uint64_t frame_no = 0;
+  ++frame_no;
+  LogPairChar("att", att, frame_no);
+  LogPairChar("foe", foe, frame_no);
+}
+}  // namespace
+
+void RRXX_SelfTestAct(PPCRegister& r3) {
+  const uint32_t att = GuestU32(r3.u32 + 20);
+  LogPair(att);
+  if (att && REXCVAR_GET(log_moves)) {
+    TopRopeTrackChar(att);
+    TopRopeTrackChar(GuestU32(att + 1112));
+  }
+  if (!att || !(GuestU32(att + 408) & 0x80000000u)) {
+    return;
+  }
+  if (REXCVAR_GET(infinite_special) && IsLikelyGuestPointer(att)) {
+    if (int32_t(GuestU32(att + 748)) < 4) {
+      StoreBE32(GuestBase() + att + 748, 4);
+    }
+    StoreBE32(GuestBase() + att + 760, 4);
+  }
+  const int32_t act = REXCVAR_GET(selftest_act);
+  if (act <= 0) {
+    return;
+  }
+  static uint32_t p1 = 0;
+  static uint64_t last_ms = 0, next_ms = 0;
+  static int count = 0;
+  const uint64_t now = LogMovesMs();
+  if (!p1 || now - last_ms > 3000) {
+    p1 = att;
+    count = 0;
+    next_ms = now + uint64_t(REXCVAR_GET(selftest_delay_s) * 1000.0);
+    REXLOG_INFO("selftest: match, P1 obj {:08X}, act {} in {:.1f} s", att, act, REXCVAR_GET(selftest_delay_s));
+  }
+  if (att != p1) {
+    return;
+  }
+  last_ms = now;
+  const uint32_t foe = GuestU32(att + 1112);
+  const bool down_mode = REXCVAR_GET(selftest_kind) == "down";  // every frame after the delay, no repeat wait
+  if ((now < next_ms && !(down_mode && count)) || !foe || GuestU32(att + 76) || GuestU32(foe + 76)) {
+    return;
+  }
+  const double repeat = REXCVAR_GET(selftest_repeat_s);
+  next_ms = repeat > 0.0 ? now + uint64_t(repeat * 1000.0) : UINT64_MAX;
+
+  std::string kind = REXCVAR_GET(selftest_kind);
+  if (kind != "lethal" && kind != "two" && kind != "solo" && kind != "down") {
+    const bool leth = (act >= 6500 && act <= 6999) || (act >= 9500 && act <= 9999) || (act >= 12000 && act <= 18999);
+    kind = leth ? "lethal" : "two";
+  }
+  PPCContext* ctx_ptr = ContextFromR3(r3, "RRXX_SelfTestAct");
+  if (!ctx_ptr) {
+    return;
+  }
+  PPCContext& ctx = *ctx_ptr;
+  uint8_t* base = GuestBase();
+  const PPCContext saved = ctx;
+  const double zero = GuestF32(0x82000BAC);  // the 0.0 constant sub_82198AB0 passes to sub_820D50A8
+  if (kind == "down") {  // R7-TOPROPE-CORNER-b: only keep the foe lying (real climb + Lethal input from the script)
+    // R7-TOPROPE-CORNER-c: re-lay at the get-up's first frame (act 20) so the foe never stands; place it ONCE
+    // `selftest_down_near` units toward the ring centre when P1 stands at a corner stand (+-25, +-25).
+    static bool placed = false;
+    static float hold[2];  // placed foe x/z: written back after each re-lay (the get-up's frame 0 root drifts ~0.02/f)
+    const uint32_t fa = GuestU32(foe + 184);
+    float ax = GuestF32(att + 240), az = GuestF32(att + 248);
+    const int32_t corner = REXCVAR_GET(selftest_corner);
+    const uint32_t p1_act = GuestU32(att + 184);
+    if (corner > 0 && !placed && (p1_act == 3001 || p1_act < 20) && (std::fabs(ax) < 21.0f || std::fabs(az) < 21.0f)) {
+      const float c[2] = {(corner == 1 || corner == 4) ? 25.0f : -25.0f, corner <= 2 ? 25.0f : -25.0f};
+      const uint32_t m = GuestU32(att + 84);  // root node: base is rebuilt from it every frame, move both
+      for (int j = 0; j < 2; ++j) {
+        uint32_t v;
+        std::memcpy(&v, &c[j], 4);
+        StoreBE32(base + att + 240 + 8 * j, v);
+        if (IsLikelyGuestPointer(m)) {
+          StoreBE32(base + m + 48 + 8 * j, v);
+        }
+      }
+      REXLOG_INFO("selftest: down P1 {:08X} act {} moved ({:.2f} {:.2f}) -> corner {} ({:.0f} {:.0f})", att, p1_act, ax, az,
+                  corner, c[0], c[1]);
+      ax = c[0];
+      az = c[1];
+    }
+    const bool at_corner = std::fabs(ax) >= 21.0f && std::fabs(az) >= 21.0f;
+    if (!at_corner && (std::fabs(ax) < 15.0f || std::fabs(az) < 15.0f)) {
+      placed = false;  // P1 left the corner (e.g. after a Lethal): place again at the next corner
+    }
+    const double near_d = REXCVAR_GET(selftest_down_near);
+    if (near_d > 0.0 && at_corner && !placed && (p1_act == 3001 || p1_act < 100)) {  // P1 idle/walk, not in a move
+      placed = true;
+      const float len = std::sqrt(ax * ax + az * az);
+      const float k = float(near_d) / len;
+      const float pos[2] = {ax - ax * k, az - az * k};
+      hold[0] = pos[0];
+      hold[1] = pos[1];
+      for (int j = 0; j < 2; ++j) {
+        uint32_t v;
+        std::memcpy(&v, &pos[j], 4);
+        StoreBE32(base + foe + 240 + 8 * j, v);
+      }
+      REXLOG_INFO("selftest: down place foe {:08X} at ({:.2f} {:.2f}), P1 act {} base ({:.2f} {:.2f} {:.2f}) yaw {:.3f}", foe,
+                  pos[0], pos[1], GuestU32(att + 184), ax, GuestF32(att + 244), az, GuestF32(att + 228));
+    }
+    // Climb: with selftest_corner, once the foe is placed start P1's own climb chain (2452 -> 168 climb -> 153 wait on
+    // top, as in the user's play log) facing the post; the scripted LB then fires the real Lethal from 153.
+    static bool climbed = false;
+    static uint64_t climb_ms = 0;
+    if (!placed) {
+      climbed = false;
+    }
+    if (climbed && climb_ms && now - climb_ms > 500) {  // 2452 did not lead into the climb: start 168 itself
+      climb_ms = 0;
+      if (p1_act != 168 && p1_act != 153 && p1_act != 2153 && p1_act != 154) {
+        ctx.r3.u64 = att;
+        ctx.r4.u64 = 168;
+        ctx.r5.u64 = 0;
+        ctx.r6.u64 = 0;
+        ctx.f1.f64 = zero;
+        sub_820D50A8(ctx, base);
+        ctx = saved;
+        REXLOG_INFO("selftest: down climb fallback P1 was act {} -> act 168 (now {}) at ({:.2f} {:.2f})", p1_act,
+                    GuestU32(att + 184), ax, az);
+      }
+    }
+    if (corner > 0 && placed && !climbed && (p1_act == 3001 || p1_act < 20)) {
+      climbed = true;
+      climb_ms = now;
+      const float yaw = std::atan2(ax, az);  // facing the post (+-28.8, +-28.8)
+      uint32_t v;
+      std::memcpy(&v, &yaw, 4);
+      StoreBE32(base + att + 228, v);
+      ctx.r3.u64 = att;
+      ctx.r4.u64 = 2452;
+      ctx.r5.u64 = 0;
+      ctx.r6.u64 = 0;
+      ctx.f1.f64 = zero;
+      sub_820D50A8(ctx, base);
+      ctx = saved;
+      REXLOG_INFO("selftest: down climb P1 {:08X} act 2452 at ({:.2f} {:.2f}) yaw {:.3f} -> now act {}", att, ax, az, yaw,
+                  GuestU32(att + 184));
+    }
+    // CENA-TEST-c: selftest_down_act > 0 lays the foe as that act var 0 (1 = face-down) instead of act 0 var 3 (face-up)
+    const uint32_t down_act = uint32_t(std::max(REXCVAR_GET(selftest_down_act), 0));
+    if (fa == down_act) {  // lying (a linked two-person move already returned above)
+      return;
+    }
+    ctx.r3.u64 = foe;
+    ctx.r4.u64 = down_act;
+    ctx.r5.u64 = down_act ? 0 : 3;
+    ctx.r6.u64 = 0;
+    ctx.f1.f64 = zero;
+    g_selftest_relay = g_selftest_relay_seen = true;
+    sub_820D50A8(ctx, base);
+    g_selftest_relay = false;
+    ctx = saved;
+    if (placed) {
+      for (int j = 0; j < 2; ++j) {
+        uint32_t v;
+        std::memcpy(&v, &hold[j], 4);
+        StoreBE32(base + foe + 240 + 8 * j, v);
+      }
+    }
+    if (++count % 200 == 1) {
+      REXLOG_INFO("selftest: down #{} foe {:08X} (was act {}) att act {} base ({:.2f} {:.2f} {:.2f}) foe base ({:.2f} {:.2f})",
+                  count, foe, fa, GuestU32(att + 184), ax, GuestF32(att + 244), az, GuestF32(foe + 240),
+                  GuestF32(foe + 248));
+    }
+    return;
+  }
+  if (REXCVAR_GET(selftest_foe_down)) {
+    ctx.r3.u64 = foe;
+    ctx.r4.u64 = 0;
+    ctx.r5.u64 = 3;
+    ctx.r6.u64 = 0;
+    ctx.f1.f64 = zero;
+    sub_820D50A8(ctx, base);
+  }
+  if (kind == "solo") {
+    ctx.r3.u64 = att;
+    ctx.r4.u64 = uint32_t(act);
+    ctx.r5.u64 = 0;
+    ctx.r6.u64 = 0;
+    ctx.f1.f64 = zero;
+    sub_820D50A8(ctx, base);
+  } else {
+    ctx.r3.u64 = att;
+    ctx.r4.u64 = foe;
+    ctx.r5.u64 = uint32_t(act);
+    const double gap = REXCVAR_GET(selftest_run_gap);
+    // V15-ALICIA-DIST: gap < 0 = the NATURAL side (user 9589/9591 logs: foe at base - 22*(sin, cos)(att yaw), facing her);
+    // gap > 0 = the R7-ALICIA-FIN-g side (only right for a move that runs +Z, which RR running Lethals do not).
+    if (kind == "lethal" && act >= 9500 && act <= 9999 && gap != 0.0) {
+      // R7-ALICIA-FIN-g: natural running Lethal = sub_8219D080 -> sub_8219B668(att, foe, act). The task (sub_8219ACC0)
+      // saves att/foe +224..+255 (angles x,yaw,z + base) at the trigger; after the 20403 intro (sub_8219AF40,
+      // 0x8219B4A4) it writes them back (+ base into [ch+256]) and calls sub_82199058 -> sub_82198AB0. So the start
+      // spacing is where both stood at the trigger: foe ~21 units ahead along the move's travel, facing her (yaw + pi).
+      // A standing P1's 95xx travels toward base + (sin, cos)(yaw) (run 1: root went that way); a running attacker's
+      // +228 reads flipped (user 9589: foe at base - 22.9*(sin, cos)), same layout. Root-root gap at f0: 17.8 vs 18.6.
+      // Foe kept inside the ropes (|x|, |z| <= 21): both are shifted toward the centre when needed.
+      const float ay = GuestF32(att + 228);
+      float apos[2] = {GuestF32(att + 240), GuestF32(att + 248)};
+      float pos[2] = {apos[0] + float(gap) * std::sin(ay), apos[1] + float(gap) * std::cos(ay)};
+      for (int j = 0; j < 2; ++j) {
+        const float lim = 21.0f;
+        const float d = pos[j] > lim ? lim - pos[j] : (pos[j] < -lim ? -lim - pos[j] : 0.0f);
+        pos[j] += d;
+        apos[j] += d;
+      }
+      float fy = ay + 3.14159265f;
+      if (fy > 3.14159265f) {
+        fy -= 6.2831853f;
+      }
+      auto put = [base](uint32_t ch, const float* xz) {
+        const uint32_t m = GuestU32(ch + 84);  // root node: keep it on the base too
+        for (int j = 0; j < 2; ++j) {
+          uint32_t v;
+          std::memcpy(&v, &xz[j], 4);
+          StoreBE32(base + ch + 240 + 8 * j, v);
+          if (IsLikelyGuestPointer(m)) {
+            StoreBE32(base + m + 48 + 8 * j, v);
+          }
+        }
+      };
+      put(foe, pos);
+      put(att, apos);
+      uint32_t v;
+      std::memcpy(&v, &fy, 4);
+      StoreBE32(base + foe + 228, v);
+      REXLOG_INFO("selftest: run place foe {:08X} at ({:.2f} {:.2f}) yaw {:.3f}, att base ({:.2f} {:.2f}) yaw {:.3f} gap {:.1f}",
+                  foe, pos[0], pos[1], fy, GuestF32(att + 240), GuestF32(att + 248), ay, gap);
+      sub_8219B668(ctx, base);
+    } else if (kind == "lethal") {
+      sub_82198AB0(ctx, base);
+    } else {
+      sub_821B4BF0(ctx, base);
+    }
+  }
+  ctx = saved;
+  REXLOG_INFO("selftest: start #{} {} act {} att {:08X} (act {} var {}) foe {:08X} (act {} var {}){}", ++count, kind, act,
+              att, GuestU32(att + 184), GuestU32(att + 188), foe, GuestU32(foe + 184), GuestU32(foe + 188),
+              REXCVAR_GET(selftest_foe_down) ? " foe downed first" : "");
 }

@@ -33,6 +33,11 @@ build\build-game-release.bat . ..\sdk-install ..\game-build codegen
 
 Result: `..\game-build\rumble_roses_xx.exe`.
 
+Native renderer (what the release ships): clone https://github.com/360recomper/rrxx-native as `..\native` (next to this
+folder), run `python ..\native\tools\rr_fetch_third_party.py`, and configure with
+`-DRRXX_NATIVE_RENDERER=ON -DRRXX_NATIVE_HOOKS=ON` (cmake/native_renderer.cmake finds `..\native`). Without it the
+game builds with the emulated renderer only.
+
 ## 3. Launcher and package
 
 ```bat
@@ -47,5 +52,5 @@ This creates `dist\RRXX-Recomp-<date>.zip`, the same layout as the GitHub releas
 ## Files this fork changes relative to upstream
 
 `CMakeLists.txt`, `rumble_roses_xx_manifest.toml`, `src/rumble_roses_xx_app.h`, `src/rumble_roses_xx_flags.cpp`,
-`src/title_hooks.cpp`. New: `launcher/`, `sdk-patch/`, `build/`, `licenses/`, `CREDITS.md`, `BUILDING.md`.
+`src/title_hooks.cpp`, `generated/rexglue.cmake`. New: `cmake/native_renderer.cmake`, `src/rrxx_native.cpp`, `launcher/`, `sdk-patch/`, `build/`, `licenses/`, `CREDITS.md`, `BUILDING.md`.
 The old `patches/rexglue-sdk/0001-...patch` is replaced by `sdk-patch/`.

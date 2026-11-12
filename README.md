@@ -9,6 +9,9 @@ It runs the original game code natively. It is not an emulator.
 ## Features
 
 - Runs natively at any resolution (up to 8K internal render scale)
+- **Native renderer (v1.5c, default):** a native D3D12/Vulkan renderer, steady 60 fps in matches even on integrated GPUs
+  like the Radeon 760M; the original emulated renderer stays as an automatic fallback. Source (GPL-3):
+  https://github.com/360recomper/rrxx-native
 - Bloom setting (off / reduced / original) and an option to turn off the background blur
 - **F4 in game:** quick settings menu and Quit
 - Fixed saving ("Failed saving data" no longer happens)

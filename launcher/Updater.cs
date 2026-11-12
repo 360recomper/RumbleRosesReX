@@ -8,7 +8,7 @@ namespace RRXXLauncher;
 
 /// <summary>
 /// Update check + in-place update from the GitHub release. Only program files are replaced (game\*.exe|dll, the launcher,
-/// top-level docs, licenses\); never game\RumbleRosesReX.toml, game\assets, saves, mods or dlss5. Replaced files are moved
+/// top-level docs, licenses\); never game\RumbleRosesReX.toml, game\assets, the native shader cache (game\shader_cache*), saves, mods or an old dlss5\ folder. Replaced files are moved
 /// to update-backups\&lt;time&gt;-to-v&lt;tag&gt;\ first. The running launcher is renamed into the backup (Windows allows renaming
 /// a running exe), so the caller restarts it afterwards.
 /// </summary>
@@ -22,7 +22,7 @@ public static class Updater
     static string DownloadDir => Path.Combine(Paths.Root, "update-download");
 
     public record Asset(string Name, long Size, string Url, string? Sha256);
-    public record Release(string Tag, string Name, string Page, Asset? Game, Asset? Dlss5Addon)
+    public record Release(string Tag, string Name, string Page, Asset? Game)
     {
         public string Version => Tag.TrimStart('v', 'V');
         public bool IsNewer => AppVersion.Newer(Tag, AppVersion.Installed);
@@ -38,7 +38,6 @@ public static class Updater
     }
 
     static readonly Regex GameZip = new(@"^RRXX-Recomp-[\w.\-]+\.zip$", RegexOptions.IgnoreCase);
-    static readonly Regex AddonZip = new(@"^RRXX-DLSS5-Addon-[\w.\-]+\.zip$", RegexOptions.IgnoreCase);
 
     static HttpClient Http(TimeSpan timeout)
     {
@@ -53,7 +52,7 @@ public static class Updater
         http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         using var doc = JsonDocument.Parse(await http.GetStringAsync(Api, ct));
         var r = doc.RootElement;
-        Asset? game = null, addon = null;
+        Asset? game = null;
         foreach (var a in r.GetProperty("assets").EnumerateArray())
         {
             var name = a.GetProperty("name").GetString() ?? "";
@@ -61,10 +60,9 @@ public static class Updater
             var sha = digest != null && digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) ? digest[7..].ToLowerInvariant() : null;
             var asset = new Asset(name, a.GetProperty("size").GetInt64(), a.GetProperty("browser_download_url").GetString() ?? "", sha);
             if (GameZip.IsMatch(name)) game = asset;
-            else if (AddonZip.IsMatch(name)) addon = asset;
         }
         return new Release(r.GetProperty("tag_name").GetString() ?? "", r.GetProperty("name").GetString() ?? "",
-            r.GetProperty("html_url").GetString() ?? ReleasesPage, game, addon);
+            r.GetProperty("html_url").GetString() ?? ReleasesPage, game);
     }
 
     /// <summary>Downloads an asset into update-download\ and checks it against the release's SHA-256 digest.</summary>
@@ -111,11 +109,12 @@ public static class Updater
     /// <summary>The files an update may write (paths relative to the install, '/' separated).</summary>
     public static bool IsProgramFile(string rel) =>
         Regex.IsMatch(rel, @"^game/[^/]+\.(exe|dll)$", RegexOptions.IgnoreCase)
+        || rel.Equals("game/pipelines_seed.bin", StringComparison.OrdinalIgnoreCase)
         || rel.Equals(LauncherName, StringComparison.OrdinalIgnoreCase)
         || (Regex.IsMatch(rel, @"^[^/]+\.(md|html|txt)$", RegexOptions.IgnoreCase) && !rel.Equals("version.txt", StringComparison.OrdinalIgnoreCase))
         || Regex.IsMatch(rel, @"^licenses/[^/]+$", RegexOptions.IgnoreCase);
 
-    /// <summary>A game exe from this install (game\ or dlss5\) is running. Unreadable paths count as running.</summary>
+    /// <summary>A game exe from this install is running. Unreadable paths count as running.</summary>
     public static bool GameRunning()
     {
         var root = Path.GetFullPath(Paths.Root).TrimEnd('\\') + "\\";
@@ -135,7 +134,8 @@ public static class Updater
     }
 
     /// <summary>Replaces the changed program files of the install with the ones in a release game zip.</summary>
-    public static Result Apply(string zipPath, string tag)
+    /// <param name="dryRun">Only list the files it would write (no writes, version.txt kept).</param>
+    public static Result Apply(string zipPath, string tag, bool dryRun = false)
     {
         if (GameRunning()) throw new InvalidOperationException("Close the game first.");
         var res = new Result();
@@ -167,6 +167,13 @@ public static class Updater
             plan.Add((e, rel, dest));
         }
 
+        if (dryRun)
+        {
+            res.Log.AddRange(plan.Select(p => (File.Exists(p.dest) ? "would replace " : "would add     ") + p.rel));
+            res.Log.Add(plan.Count == 0 ? "All program files are already up to date." : $"check only: {plan.Count} files would change");
+            return res;
+        }
+
         if (plan.Count == 0)
         {
             res.Log.Add("All program files are already up to date.");
@@ -191,7 +198,7 @@ public static class Updater
                 }
                 done.Add((dest, bak));
                 Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                // Write through a stream so the file gets today's time: Play with DLSS 5.bat copies game\ with xcopy /d.
+                // Write through a stream so the file gets today's time.
                 using (var src = e.Open())
                 using (var dst = File.Create(dest + ".new")) src.CopyTo(dst);
                 File.Move(dest + ".new", dest);
@@ -222,6 +229,40 @@ public static class Updater
         return res;
     }
 
+    /// <summary>Program files that older updaters skipped (the v1.4 IsProgramFile had no seed), so an install updated by
+    /// one lacks them although version.txt is current.</summary>
+    static readonly string[] LateFiles = { "game/pipelines_seed.bin" };
+    static string RepairMarker => Path.Combine(BackupRoot, $"repaired-v{AppVersion.Installed}.txt");
+
+    /// <summary>A late program file is missing and this version had no repair pass yet.</summary>
+    public static bool NeedsRepair =>
+        Paths.IsInstalled && !File.Exists(RepairMarker)
+        && LateFiles.Any(f => !File.Exists(Path.Combine(Paths.Root, f.Replace('/', Path.DirectorySeparatorChar))));
+
+    /// <summary>Re-applies the installed release's zip once (only missing/changed program files are written), then marks
+    /// the pass done so a zip without the file doesn't download again. Errors leave no mark (retried next start).</summary>
+    public static Result Repair(string zipPath, string tag)
+    {
+        var r = Apply(zipPath, tag);
+        Directory.CreateDirectory(BackupRoot);
+        File.WriteAllLines(RepairMarker, r.Log.Prepend($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} repair pass v{tag.TrimStart('v', 'V')}"));
+        return r;
+    }
+
+    /// <summary>Start path: when <see cref="NeedsRepair"/> and the latest GitHub release IS the installed version, downloads
+    /// its game zip (SHA-256 checked) and runs <see cref="Repair"/>. A newer release is left to the normal update.
+    /// Returns null when nothing was needed.</summary>
+    public static async Task<Result?> RepairFromRelease(CancellationToken ct = default)
+    {
+        if (!NeedsRepair || GameRunning()) return null;
+        var rel = await FetchLatest(ct);
+        if (rel.Game == null || AppVersion.Parse(rel.Tag) != AppVersion.Parse(AppVersion.Installed)) return null;
+        var zip = await Download(rel.Game, null, ct);
+        var r = await Task.Run(() => Repair(zip, rel.Tag), ct);
+        CleanDownloads();
+        return r;
+    }
+
     /// <summary>After a successful update: drop the downloaded zip.</summary>
     public static void CleanDownloads()
     {
@@ -230,7 +271,9 @@ public static class Updater
 
     /// <summary>
     /// Headless (scripts, tests): --update [--check-only] [--force] [--zip &lt;file&gt; --sha &lt;hex&gt; --tag &lt;vX&gt;].
-    /// Without --zip it asks GitHub and downloads the game zip. Log in update-backups\cli-log.txt; exit 0 = ok.
+    /// Without --zip it asks GitHub and downloads the game zip; with --zip, --check-only lists the files it would write.
+    /// --repair [--zip ... --sha ... --tag ...] = the start-path repair pass (<see cref="NeedsRepair"/>; with --zip the tag
+    /// must be the installed version). Log in update-backups\cli-log.txt; exit 0 = ok.
     /// </summary>
     public static int Cli(string[] args)
     {
@@ -240,17 +283,27 @@ public static class Updater
         try
         {
             string zipPath, tag;
+            bool repair = args[0] == "--repair";
+            if (repair && !NeedsRepair) { log.Add("repair: nothing to do"); goto end; }
+            if (repair && Opt("--zip") == null)
+            {
+                var rr = RepairFromRelease().GetAwaiter().GetResult();
+                log.AddRange(rr?.Log.Prepend("repair from GitHub release:") ?? new[] { "repair: latest release is not the installed version, skipped" });
+                goto end;
+            }
             if (Opt("--zip") is { } z)
             {
                 tag = Opt("--tag") ?? throw new ArgumentException("--tag missing");
                 var want = (Opt("--sha") ?? throw new ArgumentException("--sha missing")).ToLowerInvariant();
                 if (Sha256(z) != want) throw new InvalidDataException("SHA-256 mismatch");
                 zipPath = z;
+                if (repair && AppVersion.Parse(tag) != AppVersion.Parse(AppVersion.Installed))
+                    throw new ArgumentException($"--repair: --tag {tag} is not the installed v{AppVersion.Installed}");
             }
             else
             {
                 var rel = FetchLatest().GetAwaiter().GetResult();
-                log.Add($"latest {rel.Tag} '{rel.Name}', game zip {rel.Game?.Name} {rel.Game?.Sha256}, add-on {rel.Dlss5Addon?.Name}");
+                log.Add($"latest {rel.Tag} '{rel.Name}', game zip {rel.Game?.Name} {rel.Game?.Sha256}");
                 log.Add(rel.IsNewer ? $"Update available v{rel.Version}" : "Up to date");
                 if (args.Contains("--check-only") || (!rel.IsNewer && !args.Contains("--force"))) goto end;
                 var g = rel.Game ?? throw new InvalidDataException("release has no game zip");
@@ -258,10 +311,11 @@ public static class Updater
                 log.Add("downloaded + SHA-256 ok: " + zipPath);
                 tag = rel.Tag;
             }
-            var r = Apply(zipPath, tag);
+            bool dry = args.Contains("--check-only");
+            var r = repair ? Repair(zipPath, tag) : Apply(zipPath, tag, dry);
             log.AddRange(r.Log);
             if (r.RestartExe != null) log.Add("launcher replaced: restart needed");
-            if (!args.Contains("--keep-download")) CleanDownloads();
+            if (!dry && !args.Contains("--keep-download")) CleanDownloads();
         }
         catch (Exception ex) { log.Add("ERROR: " + ex.Message); rc = 1; }
         end:

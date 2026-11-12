@@ -24,3 +24,11 @@ else()
 endif()
 
 rexglue_setup_target(rumble_roses_xx GPU_PLUGINS xenos)
+
+# Native renderer (cmake/native_renderer.cmake): compiled in, picked at run time with
+# rrxx_renderer (default native since RR-NR-12, emulated = fallback). build-game-v010-native.bat sets it (kept in the CMake cache).
+option(RRXX_NATIVE_RENDERER "Compile in the native renderer scaffolding (RR-NR-4)" OFF)
+if(RRXX_NATIVE_RENDERER)
+    include(cmake/native_renderer.cmake)
+    rrxx_add_native_renderer(rumble_roses_xx)
+endif()

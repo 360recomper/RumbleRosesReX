@@ -2,9 +2,9 @@ namespace RRXXLauncher.Tabs;
 
 public class ModsTab : ILauncherTab
 {
-    readonly Panel root = new() { Dock = DockStyle.Fill };
-    readonly CheckBox master = new() { Text = "Mods enabled (turns off the replacement-files overlay and all costumes)", AutoSize = true };
-    readonly CheckedListBox list = new() { Width = 540, Height = 200, CheckOnClick = true };
+    readonly Panel root = new() { Dock = DockStyle.Fill, BackColor = Theme.Bg };
+    readonly CheckBox master = new DarkCheck { Text = "Mods enabled (turns off the replacement-files overlay and all costumes)", AutoSize = true };
+    readonly CheckedListBox list = new DarkCheckedList { Width = Theme.S(560), Height = Theme.S(220), CheckOnClick = true };
     readonly Label info = Ui.Text("");
     List<Costumes.ModFolder> shown = new();
     Config cfg = new();
@@ -16,11 +16,11 @@ public class ModsTab : ILauncherTab
     {
         var col = Ui.Column();
         col.Controls.Add(master);
-        col.Controls.Add(Ui.Text("Costumes", true));
+        col.Controls.Add(Ui.Head("Costumes"));
         col.Controls.Add(Ui.Text("Costume folders from mods\\costumes\\ (each needs a cos.dat). Every one gets its own free slot and shows up under Others > Locker Room."));
         col.Controls.Add(list);
-        var row = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight };
-        row.Controls.Add(Ui.Btn("Apply", (_, _) => Apply(), 100));
+        var row = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, Theme.S(8), 0, 0) };
+        row.Controls.Add(Ui.Primary(Ui.Btn("Apply", (_, _) => Apply(), 100)));
         row.Controls.Add(Ui.Btn("Open mods folder", (_, _) => Ui.OpenFolder(Paths.Mods)));
         row.Controls.Add(Ui.Btn("Open costumes folder", (_, _) => Ui.OpenFolder(Paths.CostumeMods)));
         col.Controls.Add(row);

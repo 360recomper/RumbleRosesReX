@@ -88,15 +88,34 @@ public static class Attire
 
     // ---------------------------------------------------------------- the TOML value
 
-    /// <summary>Slot -> costume id from lambda_model_overrides (entries like "3=480" or "5=481+head"; the id is the leading number).</summary>
-    public static Dictionary<int, int> Current(Toml t)
+    public const int Colours = 4;
+
+    /// <summary>Slot -> the 4 costume ids (colour 1-4) from lambda_model_overrides. An entry is "3=480" (all colours),
+    /// "5=481+head" (flags ignored here) or "1=622/466/620/621"; a missing or 0 colour falls back to colour 1 (as the game does).</summary>
+    public static Dictionary<int, int[]> Current(Toml t)
     {
-        var res = new Dictionary<int, int>();
+        var res = new Dictionary<int, int[]>();
         foreach (var (slot, rest) in Entries(t.Get(Key) ?? ""))
         {
-            var digits = new string(rest.TakeWhile(char.IsDigit).ToArray());
-            if (int.TryParse(digits, out var id)) res[slot] = id;
+            var ids = Tokens(rest).Select(Lead).ToArray();
+            if (ids[0] > 0) res[slot] = ids;
         }
+        return res;
+    }
+
+    static int Lead(string tok)
+    {
+        var digits = new string(tok.TakeWhile(char.IsDigit).ToArray());
+        return int.TryParse(digits, out var id) ? id : 0;
+    }
+
+    /// <summary>The 4 raw colour tokens of one entry ("481+head" stays whole); gaps are filled from colour 1.</summary>
+    static string[] Tokens(string rest)
+    {
+        var parts = rest.Split('/', StringSplitOptions.TrimEntries);
+        var res = new string[Colours];
+        for (int i = 0; i < Colours; i++)
+            res[i] = parts.Length == 1 || i >= parts.Length || Lead(parts[i]) == 0 ? parts[0] : parts[i];
         return res;
     }
 
@@ -111,21 +130,21 @@ public static class Attire
         return res;
     }
 
-    /// <summary>Writes the picks into the TOML (backup first). Other slots and every other line stay as they are.</summary>
-    public static string Apply(Dictionary<int, int> picks)
+    /// <summary>Writes the picks (slot -> 4 ids) into the TOML (backup first). Other slots and every other line stay as they are.
+    /// A colour whose model did not change keeps its flags ("+head"); a new model drops them.</summary>
+    public static string Apply(Dictionary<int, int[]> picks)
     {
         var t = new Toml();
         var entries = Entries(t.Get(Key) ?? "");
-        foreach (var (slot, id) in picks)
+        foreach (var (slot, ids) in picks)
         {
             int i = entries.FindIndex(e => e.slot == slot);
-            if (i >= 0)
-            {
-                var old = entries[i].rest;
-                var digits = new string(old.TakeWhile(char.IsDigit).ToArray());
-                if (digits != id.ToString()) entries[i] = (slot, id.ToString());   // a new model: drop "+head"-style flags
-            }
-            else entries.Add((slot, id.ToString()));
+            var old = i >= 0 ? Tokens(entries[i].rest) : new string[Colours];
+            var tok = new string[Colours];
+            for (int c = 0; c < Colours; c++)
+                tok[c] = old[c] != null && Lead(old[c]) == ids[c] ? old[c] : ids[c].ToString();
+            var rest = tok.All(x => x == tok[0]) ? tok[0] : string.Join("/", tok);
+            if (i >= 0) entries[i] = (slot, rest); else entries.Add((slot, rest));
         }
         var backup = Backup();
         t.Set(Key, "\"" + string.Join(", ", entries.OrderBy(e => e.slot).Select(e => $"{e.slot}={e.rest}")) + "\"");

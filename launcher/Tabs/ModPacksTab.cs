@@ -6,11 +6,11 @@ namespace RRXXLauncher.Tabs;
 /// </summary>
 public class ModPacksTab : ILauncherTab
 {
-    readonly Panel root = new() { Dock = DockStyle.Fill, AutoScroll = true };
-    readonly ListBox list = new() { Width = 540, Height = 110 };
+    readonly Panel root = new() { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Theme.Bg };
+    readonly ListBox list = new DarkList { Width = Theme.S(560), Height = Theme.S(120) };
     readonly Label status = Ui.Text("");
     readonly Label current = Ui.Text("");
-    readonly ProgressBar bar = new() { Width = 540, Height = 18, Maximum = 1000 };
+    readonly ProgressBar bar = new PinkBar { Width = Theme.S(540), Height = Theme.S(18), Maximum = 1000 };
     readonly Button installBtn, removeBtn, cancelBtn;
     List<ModPack.Record> installed = new();
     CancellationTokenSource? cts;
@@ -21,15 +21,15 @@ public class ModPacksTab : ILauncherTab
     public ModPacksTab()
     {
         var col = Ui.Column();
-        col.Controls.Add(Ui.Text("Mod packs", true));
+        status.ForeColor = Theme.PinkText;
         col.Controls.Add(status);   // right under the title so a message is never pushed out of view
         col.Controls.Add(Ui.Text("A mod pack (.rrxxpack) holds only the changes: the launcher rebuilds its files from your own game files "
             + "(the ISO you chose in Setup), so it first checks that your ISO is the right version. Everything it changes is recorded and "
             + "can be removed again with Uninstall. Close the game before installing or removing a pack."));
-        col.Controls.Add(Ui.Text("Installed", true));
+        col.Controls.Add(Ui.Head("Installed"));
         col.Controls.Add(list);
-        var row = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight };
-        installBtn = Ui.Btn("Install a pack...", async (_, _) => await InstallPack());
+        var row = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, Theme.S(8), 0, 0) };
+        installBtn = Ui.Primary(Ui.Btn("Install a pack...", async (_, _) => await InstallPack()));
         removeBtn = Ui.Btn("Uninstall selected", async (_, _) => await RemovePack());
         cancelBtn = Ui.Btn("Cancel", (_, _) => cts?.Cancel(), 90);
         cancelBtn.Enabled = false;
@@ -104,7 +104,7 @@ public class ModPacksTab : ILauncherTab
                 + (h.Toml.Count > 0 ? ", sets " + string.Join(", ", h.Toml.Keys) : "")
                 + (h.Save != null ? $" and fills {h.Save.Regions.Count} save slots (created wrestlers and movesets) in every profile" : "")
                 + ".\nAll of it can be undone with Uninstall.\n\nInstall now?";
-            if (MessageBox.Show(msg, "Install mod pack", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            if (DarkBox.Show(msg, "Install mod pack", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                 return Task.CompletedTask;
         }
         catch (Exception ex) { status.Text = ex.Message; return Task.CompletedTask; }
@@ -115,7 +115,7 @@ public class ModPacksTab : ILauncherTab
     {
         if (list.SelectedIndex < 0 || list.SelectedIndex >= installed.Count) return Task.CompletedTask;
         var rec = installed[list.SelectedIndex];
-        if (MessageBox.Show($"Uninstall \"{rec.Title}\"?\n\nIts files are removed, anything it replaced is put back, its game settings "
+        if (DarkBox.Show($"Uninstall \"{rec.Title}\"?\n\nIts files are removed, anything it replaced is put back, its game settings "
                 + "are restored and its save slots get their old contents back (the rest of your save stays as it is).",
                 "Uninstall mod pack", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return Task.CompletedTask;

@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RRXX Launcher</AssemblyName>
     <!-- Keep = AppVersion.Launcher; the updater never swaps in a launcher with a lower file version. -->
-    <Version>1.4.0</Version>
+    <Version>1.5.0</Version>
     <RootNamespace>RRXXLauncher</RootNamespace>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -18,4 +18,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <DebugType>none</DebugType>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="art\rose-64.png" LogicalName="RRXXLauncher.art.rose-64.png" />
+    <EmbeddedResource Include="art\rose-256.png" LogicalName="RRXXLauncher.art.rose-256.png" />
+  </ItemGroup>
 </Project>

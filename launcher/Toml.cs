@@ -43,6 +43,9 @@ public class Toml
         if (line == null) { if (i >= 0) lines.RemoveAt(i); }
         else if (i >= 0) lines[i] = line; else lines.Add(line);
     }
+    /// <summary>A quoted TOML string (basic string: backslash and quote escaped).</summary>
+    public void SetStr(string key, string v) => Set(key, "\"" + v.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"");
+    public string GetStr(string key, string def) => Get(key) is { } s ? s.Replace("\\\"", "\"").Replace("\\\\", "\\") : def;
     public void Set(string key, int v) => Set(key, v.ToString());
     public void Set(string key, bool v) => Set(key, v ? "true" : "false");
 

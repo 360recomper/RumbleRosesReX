@@ -18,5 +18,8 @@ public static class Paths
     public static string DlcHeaders => Path.Combine(Title, "Headers", "00000002");
     public static string Config => Path.Combine(Root, "launcher.json");
 
-    public static bool IsInstalled => File.Exists(GameExe) && File.Exists(Path.Combine(Assets, "default.xex"));
+    public static string ImportMarker => Path.Combine(Game, ".iso-import-unfinished");
+
+    /// <summary>Exe + xex present and no unfinished-import marker (written before extraction, removed after it succeeds).</summary>
+    public static bool IsInstalled => File.Exists(GameExe) && File.Exists(Path.Combine(Assets, "default.xex")) && !File.Exists(ImportMarker);
 }

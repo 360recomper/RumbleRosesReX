@@ -99,7 +99,7 @@ public class Xgd : IDisposable
         return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
     }
 
-    public void ExtractAll(string outRoot, IProgress<(string, double)> progress, CancellationToken ct)
+    public void ExtractAll(string outRoot, IProgress<(string, double)> progress, CancellationToken ct, bool force = false)
     {
         var files = Entries.Where(e => !e.IsDir).ToList();
         long total = files.Sum(f => f.Size), done = 0;
@@ -111,7 +111,7 @@ public class Xgd : IDisposable
             var dest = Path.GetFullPath(Path.Combine(root, e.Path.Replace('/', '\\')));
             if (!dest.StartsWith(root + Path.DirectorySeparatorChar)) throw new InvalidDataException("Path escapes output: " + e.Path);
             Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-            if (File.Exists(dest) && new FileInfo(dest).Length == e.Size) { done += e.Size; continue; }
+            if (!force && File.Exists(dest) && new FileInfo(dest).Length == e.Size) { done += e.Size; continue; }
             var tmp = dest + ".part";
             using (var o = new FileStream(tmp, FileMode.Create, FileAccess.Write))
             {
